@@ -1,0 +1,12 @@
+sample:
+  description: Bare-metal core1 stepper motor control with LAN9250 Ethernet and USB CDC-ACM console
+  name: rp2350 zephyr stepper
+common:
+  min_ram: 32
+  min_flash: 64
+  tags: networking ethernet multicore
+  platform_allow:
+    - rpi_pico2/rp2350a/m33
+tests:
+  sample.net.dhcpv4_lan9250_stepper:
+    tags: networking ethernet multicore

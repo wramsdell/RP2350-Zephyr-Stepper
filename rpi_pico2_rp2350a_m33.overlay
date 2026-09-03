@@ -1,0 +1,67 @@
+#include <zephyr/dt-bindings/pinctrl/rpi-pico-rp2350a-pinctrl.h>
+
+&pinctrl {
+    spi0_default: spi0_default {
+        group1 {
+            pinmux = <SPI0_CSN_P17>, <SPI0_SCK_P18>, <SPI0_TX_P19>;
+        };
+        group2 {
+            pinmux = <SPI0_RX_P16>;
+            input-enable;
+        };
+    };
+};
+
+&spi0 {
+    status = "okay";
+    clock-frequency = <DT_FREQ_M(8)>;
+    pinctrl-0 = <&spi0_default>;
+    pinctrl-names = "default";
+    cs-gpios = <&gpio0 17 GPIO_ACTIVE_LOW>;
+
+    lan9250: lan9250@0 {
+        status = "okay";
+        compatible = "microchip,lan9250";
+        reg = <0x0>;
+        local-mac-address = [00 00 00 01 02 03];
+        spi-max-frequency = <10000000>;
+        int-gpios = <&gpio0 20 GPIO_ACTIVE_LOW>;
+        /* reset-gpios = <&gpio0 22 GPIO_ACTIVE_LOW>; */  /* unsupported by microchip,lan9250 binding; see gpio-hog below */
+    };
+};
+
+&gpio0 {
+    status = "okay";
+//    lan9250_reset {
+//        gpio-hog;
+//        gpios = <22 GPIO_ACTIVE_HIGH>;
+//        output-high;
+//    };
+};
+
+/* Reserve the top 128KB (2x64KB) of SRAM for the bare-metal core1 image at
+ * 0x20062000-0x20082000; Zephyr/core0 is confined to the bottom 392KB.
+ * CONFIG_SRAM_SIZE/CONFIG_SRAM_BASE_ADDRESS (and thus the linker RAM region
+ * and the RP2350 MPU SRAM_0 region) derive directly from this node's reg. */
+&sram0 {
+    reg = <0x20000000 DT_SIZE_K(392)>;
+};
+
+&mbox {
+    status = "okay";
+};
+
+/ {
+    chosen {
+        zephyr,console = &cdc_acm_uart0;
+        zephyr,shell-uart = &cdc_acm_uart0;
+    };
+};
+
+&zephyr_udc0 {
+    cdc_acm_uart0: cdc_acm_uart0 {
+        status = "okay";
+        compatible = "zephyr,cdc-acm-uart";
+        label = "Zephyr USB CDC ACM";
+    };
+};
