@@ -1,0 +1,43 @@
+;
+; stepper.pio  —  per-step protocol
+;
+; One push to TX FIFO = one step at that speed.
+; SM blocks at "pull block" when FIFO is empty: no spurious pulses,
+; and the move ends naturally without any SM disable / drain.
+;
+; Side-set pin 0 = STEP output (GP15)
+;
+; Timing:
+;   Overhead per step: 6 PIO clock cycles
+;   Total period     = 2 * (half_period + 3)  cycles
+;   Step frequency   = f_pio / (2 * half_period + 6)
+;   half_period      = f_pio / (2 * step_freq) - 3
+;
+;   At f_pio = 150 MHz (this board's clk_sys - see core1_main.c):
+;     half_period = 0           →  ~25.0 MHz  (not useful)
+;     half_period = 372         →  ~200 kHz
+;     half_period = 3_747       →   20 kHz
+;     half_period = 74_999_997  →    1 Hz
+;
+; STEP high duration = half_period + 3  cycles  (50 % duty cycle)
+; STEP low  duration = half_period + 3  cycles
+;
+; No `% c-sdk { ... %}` block here deliberately: core1 is a freestanding,
+; non-Zephyr, non-Pico-SDK build (see regs.h's header comment for why), so
+; SM init/push are hand-rolled against raw registers in core1_main.c
+; instead of using the Pico SDK C-SDK helpers pioasm would otherwise
+; generate for this program.
+
+.program stepper
+.side_set 1
+
+.wrap_target
+    pull block          side 0  ; [1] wait for next step — SM stalls here when idle
+    mov y, osr          side 0  ; [1] y = half-period for this step
+    mov x, y            side 1  ; [1] STEP high, x = countdown
+high_loop:
+    jmp x-- high_loop   side 1  ; [1/cycle] y+1 iterations
+    mov x, y            side 0  ; [1] STEP low, x = countdown
+low_loop:
+    jmp x-- low_loop    side 0  ; [1/cycle] y+1 iterations
+.wrap                           ;     → back to pull block

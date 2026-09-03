@@ -18,6 +18,7 @@ Core1's actual workload, and the mailbox protocol that controls it, are new
 ```
 CMakeLists.txt                 Top-level app build; wires core1's build in
 cmake/core1.cmake              Cross-compiles + embeds the core1 image
+cmake/pioasm.cmake             Builds pioasm as a native host tool (see below)
 prj.conf                       Core0 (Zephyr) Kconfig
 rpi_pico2_rp2350a_m33.overlay  Devicetree: SRAM split, mbox, LAN9250, USB console
 
@@ -41,6 +42,9 @@ core1/                         Bare-metal core1 image sources (NOT Zephyr)
                                 call core1_main()
   core1_main.c                 GPIO/PIO bring-up, trapezoidal motion state
                                 machine, mailbox command handling
+  stepper.pio                  PIO assembly source for STEP pulse generation -
+                                real, editable source, not pre-assembled bytes
+                                (see "PIO: STEP pulse generation" below)
   regs.h                       Minimal raw register definitions (see below
                                 for why this doesn't use the Pico SDK's
                                 hardware/structs headers) - extended from the
@@ -123,19 +127,23 @@ Unchanged from the multicore project. There is exactly one build
 (`west build`) and one flash (one `zephyr.uf2`). Core1's firmware is
 embedded inside Core0's image and copied into place by Core0 at runtime:
 
-1. **Cross-compile** (`cmake/core1.cmake`): the three `core1/*.c` sources are
+1. **Assemble** (`cmake/pioasm.cmake` + the `core1.cmake` step that uses it):
+   `core1/stepper.pio` is assembled into a generated `stepper.pio.h` by
+   `pioasm` - see "PIO: STEP pulse generation" below for how `pioasm` itself
+   gets built and invoked.
+2. **Cross-compile** (`cmake/core1.cmake`): the three `core1/*.c` sources are
    compiled and linked against `core1/linker.ld` with the same
    `arm-zephyr-eabi-gcc`/`objcopy` Core0 uses (resolved automatically by
    `find_package(Zephyr REQUIRED)`), but with `-ffreestanding -nostdlib
    -nostartfiles` and none of Zephyr's normal compile flags — producing
    `core1.elf`, then `core1.bin` (a raw flat binary; link address == load
    address, so no relocation is needed).
-2. **Embed**: Zephyr's own `generate_inc_file_for_target()` CMake helper
+3. **Embed**: Zephyr's own `generate_inc_file_for_target()` CMake helper
    turns `core1.bin` into a generated `core1_blob.bin.inc` — a plain
    comma-separated byte list. `src/core1_blob.c` `#include`s it into a
    `const uint8_t core1_blob[]` array, which becomes part of the ordinary
    Core0 Zephyr binary and thus part of `zephyr.uf2`.
-3. **Load at boot** (`core1_launch()` in `src/core1_launch.c`, called near
+4. **Load at boot** (`core1_launch()` in `src/core1_launch.c`, called near
    the top of Core0's `main()`): `memcpy()`s `core1_blob` verbatim into
    `0x20062000`, reads the initial stack pointer and entry point directly
    out of the copied vector table's first two words, then performs the
@@ -145,17 +153,44 @@ embedded inside Core0's image and copied into place by Core0 at runtime:
 
 ## PIO: STEP pulse generation
 
-Core1 has no Pico SDK PIO C-SDK available (same reasoning as above), so
-`core1/core1_main.c` programs PIO0 SM0 directly against raw registers.
-Ported straight from `stepper.pio`'s already-assembled program (its
-generated `build/stepper.pio.h` gave the exact instruction words - no new
-assembly needed):
+`core1/stepper.pio` is real, editable PIO assembly source - not
+pre-assembled bytes copied from another project. Getting from that source
+to instruction words core1 can load into `PIO0_INSTR_MEM0` needs `pioasm`,
+the Pico SDK's own PIO assembler - a completely separate tool from
+`arm-zephyr-eabi-gcc` (PIO has its own small, distinct instruction set;
+generic C compilers have no concept of it). `pioasm`'s source is vendored
+in `hal_rpi_pico` (`modules/hal/rpi_pico/tools/pioasm`) - it ships with the
+Pico SDK - but it's a code generator that must run *on the build machine*,
+not be cross-compiled for the RP2350. So `cmake/pioasm.cmake` builds it as
+a wholly separate, native-host CMake sub-build via `ExternalProject_Add`,
+deliberately not forwarding this project's ARM cross-compiler settings, so
+its own fresh `cmake` invocation picks up the host's default `cc`/`c++` the
+same way any ordinary native build would.
 
-```c
-static const uint16_t stepper_program[] = {
-    0x80a0, 0xa047, 0xb022, 0x1043, 0xa022, 0x0045,
-};
-```
+`cmake/core1.cmake` then runs the resulting `pioasm` executable against
+`core1/stepper.pio` (`pioasm -o c-sdk stepper.pio stepper.pio.h`) as a
+build step ordered before compiling `core1_main.c`, which
+`#include "stepper.pio.h"`s the result and uses its generated
+`stepper_program_instructions[]`/`stepper_wrap_target`/`stepper_wrap`
+directly - so editing `stepper.pio` and rebuilding (`west build`, no
+`--pristine` needed) regenerates and relinks everything downstream
+automatically, the same as editing any other source file.
+
+`stepper.pio` deliberately has no `% c-sdk { ... %}` block (the mechanism
+`.pio` files normally use to also emit Pico-SDK-dependent C-SDK helper
+functions like `stepper_program_init()`): that block's contents get copied
+into the generated header *unconditionally*, `#include "hardware/clocks.h"`
+and all, which would reintroduce the same `pico.h` chain-into-Zephyr-shims
+problem `regs.h`'s header comment describes above. Compiling with
+`-DPICO_NO_HARDWARE=1` (set in `core1.cmake`) additionally makes the
+generated header skip its own `#include "hardware/pio.h"` and the `struct
+pio_program`/`stepper_program_get_default_config()` it would otherwise
+define - both guarded by `#if !PICO_NO_HARDWARE` in `pioasm`'s own
+`c-sdk` output template - leaving just the plain, dependency-free
+instruction array and `wrap`/`wrap_target` `#define`s this freestanding
+build actually needs. Core1 hand-rolls the rest of the SM setup (pin
+config, `EXECCTRL`, pin-direction handshake) against raw registers itself -
+see the init sequence below.
 
 One push to the PIO TX FIFO produces exactly one STEP pulse, at a period
 encoded by the pushed word (a half-period in PIO clock cycles). The state
@@ -170,11 +205,16 @@ SDK's own `hardware_pio` implementation, not guessed):
    pattern used for `TIMER0`).
 2. Configure GP15's pad (clear the ISO latch, same as every other GPIO
    here) with `FUNCSEL=6` (PIO0).
-3. Load the 6 instruction words into `PIO0_INSTR_MEM0` onward.
-4. Write `SM0_EXECCTRL` to set `WRAP_TOP=5`/`WRAP_BOTTOM=0` (a direct write
-   is safe here - `EXECCTRL`'s power-on reset value is `0x0001f000`, and
-   every other field's reset default of 0 is what this program needs
-   anyway).
+3. Load the instruction words (`stepper_program_instructions[]`, from the
+   generated header - `STEPPER_PROGRAM_LENGTH` of them) into
+   `PIO0_INSTR_MEM0` onward.
+4. Write `SM0_EXECCTRL` to set `WRAP_TOP`/`WRAP_BOTTOM` from the generated
+   `stepper_wrap`/`stepper_wrap_target` (a direct write is safe here -
+   `EXECCTRL`'s power-on reset value is `0x0001f000`, and every other
+   field's reset default of 0 is what this program needs anyway). Because
+   these come from pioasm's output rather than being typed in by hand,
+   editing `stepper.pio`'s `.wrap`/`.wrap_target` can never silently drift
+   out of sync with what core1_main.c programs into the SM.
 5. **Pin direction** - the one non-obvious step. PIO-routed pins get their
    output-enable from the PIO block itself, not `SIO_GPIO_OE`, so it has to
    be set by *executing* a `SET PINDIRS` instruction on the state machine

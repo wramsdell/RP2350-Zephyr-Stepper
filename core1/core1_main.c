@@ -2,6 +2,7 @@
 
 #include "regs.h"
 #include "mailbox_proto.h"
+#include "stepper.pio.h" /* generated from stepper.pio by pioasm - see cmake/core1.cmake */
 
 /*
  * Bare-metal core1: open-loop trapezoidal stepper motion via PIO-generated
@@ -36,11 +37,8 @@
 #define DEF_ACCEL     1000000.0f
 #define DEF_DECEL     1000000.0f
 
-/* Assembled stepper.pio program (wrap_target=0, wrap=5, 1-bit side-set) -
- * taken verbatim from Stepper-Control's generated build/stepper.pio.h. */
-static const uint16_t stepper_program[] = {
-	0x80a0, 0xa047, 0xb022, 0x1043, 0xa022, 0x0045,
-};
+#define STEPPER_PROGRAM_LENGTH \
+	(sizeof(stepper_program_instructions) / sizeof(stepper_program_instructions[0]))
 
 typedef enum { IDLE, MOVING } motion_state_t;
 
@@ -119,18 +117,20 @@ static void pio_step_init(void)
 
 	gpio_pad_init(PIN_STEP, PIO0_FUNCSEL);
 
-	for (uint32_t i = 0; i < 6u; i++) {
-		REG(PIO0_INSTR_MEM0 + 4u * i) = stepper_program[i];
+	for (uint32_t i = 0; i < STEPPER_PROGRAM_LENGTH; i++) {
+		REG(PIO0_INSTR_MEM0 + 4u * i) = stepper_program_instructions[i];
 	}
 
-	/* WRAP_TOP=5, WRAP_BOTTOM=0; SIDE_EN/SIDE_PINDIR left at their
-	 * reset-default 0 (side-set is always applied, not optional, and
-	 * doesn't control pin direction) - matches
-	 * stepper_program_get_default_config()'s
+	/* WRAP_TOP/WRAP_BOTTOM come from pioasm's generated stepper_wrap/
+	 * stepper_wrap_target (see stepper.pio.h), so they always match
+	 * whatever's actually in stepper.pio - no magic numbers to keep in
+	 * sync by hand. SIDE_EN/SIDE_PINDIR are left at their reset-default 0
+	 * (side-set is always applied, not optional, and doesn't control pin
+	 * direction) - matches stepper_program_get_default_config()'s
 	 * sm_config_set_sideset(&c, 1, false, false). EXECCTRL's reset value
 	 * is 0x0001f000, so this direct write is safe (no other field needs
 	 * preserving). */
-	REG(PIO0_SM0_EXECCTRL) = (5u << 12) | (0u << 7);
+	REG(PIO0_SM0_EXECCTRL) = (stepper_wrap << 12) | (stepper_wrap_target << 7);
 
 	/*
 	 * Pin direction: PIO-routed pins get their output-enable from the
