@@ -10,6 +10,8 @@ target_sources(app PRIVATE
     src/core1_launch.c
     src/stepper_shell.c
     src/core1_blob.c
+    src/mdns_service.c
+    src/eth_id.c
 )
 
 include(cmake/core1.cmake)

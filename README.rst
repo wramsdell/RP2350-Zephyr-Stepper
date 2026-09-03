@@ -7,7 +7,12 @@ Overview
 Zephyr application for the Raspberry Pi Pico 2 (RP2350) that brings up a
 Microchip LAN9250 SPI Ethernet controller and runs a DHCPv4 client over it.
 The USB port is used as a CDC-ACM serial console/shell instead of a physical
-UART.
+UART. The board also answers to ``stepperXXXX.local`` via mDNS (``XXXX`` =
+the last two bytes, in hex, of a MAC address derived from the RP2350's real
+per-chip unique ID - see ``src/eth_id.c`` - so each board gets its own
+stable, distinct name) and advertises a network shell over telnet via
+DNS-SD, so it's controllable over the network without knowing its
+DHCP-assigned IP or plugging in USB.
 
 It also demonstrates asymmetric multiprocessing on the RP2350: Core0
 (Zephyr) loads and launches independent bare-metal C code onto Core1 at
@@ -68,6 +73,16 @@ plugging in) and copying the resulting image:
 The board will reboot automatically and enumerate a USB CDC-ACM serial
 console (``/dev/ttyACM0``).
 
+Once it has a DHCP lease, the same shell is also reachable over the
+network:
+
+.. code-block:: console
+
+   telnet stepperXXXX.local
+   # or, if mDNS resolution isn't available:
+   avahi-browse -r _telnet._tcp    # find it and its IP
+   telnet <ip-address>
+
 Shell commands
 **************
 
@@ -90,3 +105,11 @@ driver by default, whose ``pico_rand`` module places an
 ``.uninitialized_data`` section inside the RAM data-copy region immediately
 before ``usbd_context_area``, corrupting the CDC-ACM USB device context on
 boot and preventing it from enumerating.
+
+Getting mDNS/DNS-SD actually discoverable over the LAN9250 required four
+independent fixes (unique MAC applied without an admin down/up cycle, a
+forced IGMP rejoin once the link is confirmed up, promiscuous mode to work
+around the driver's missing multicast RX filter, and a generously-sized RX
+buffer pool since promiscuous mode means every frame on the LAN gets
+examined) - see "Network discovery" in `THEORY_OF_OPERATION.md
+<THEORY_OF_OPERATION.md>`_ for the full explanation of each.

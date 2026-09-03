@@ -15,6 +15,8 @@ LOG_MODULE_REGISTER(net_dhcpv4_client_sample, LOG_LEVEL_DBG);
 
 #include "core1_launch.h"
 #include "stepper_shell.h"
+#include "mdns_service.h"
+#include "eth_id.h"
 
 #define DHCP_OPTION_NTP (42)
 
@@ -42,6 +44,12 @@ static void handler(struct net_mgmt_event_callback *cb,
 	if (mgmt_event != NET_EVENT_IPV4_ADDR_ADD) {
 		return;
 	}
+
+	/* A bound IPv4 address means DHCP just completed a real Ethernet
+	 * round trip, so the link is confirmed up - unlike at boot, when
+	 * mDNS's own early multicast join can silently fail in hardware
+	 * before the PHY has linked. See mdns_force_multicast_rejoin(). */
+	mdns_force_multicast_rejoin(iface);
 
 	for (i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
 		char buf[NET_IPV4_ADDR_LEN];
@@ -88,6 +96,10 @@ struct phy_data {
 int main(void)
 {
 	LOG_INF("Run dhcpv4 client");
+
+	set_unique_mac_address();
+	enable_multicast_rx();
+	set_unique_hostname();
 
 	if (core1_launch()) {
 		LOG_ERR("Failed to launch core1");

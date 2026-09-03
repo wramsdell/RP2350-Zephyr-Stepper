@@ -357,3 +357,160 @@ asynchronously via IRQ.
 Sequencing note: `core1_launch()` runs before `stepper_mbox_init()` enables
 the mbox IRQ, so there's no need to save/restore the SIO FIFO IRQ enable
 state around the launch handshake.
+
+## Network discovery: per-board unique ID, mDNS hostname + DNS-SD service (Core0 only)
+
+Unrelated to the core0/core1 split above, but worth documenting: Core0
+answers to `stepperXXXX.local` over mDNS (`XXXX` = the last 2 bytes, in hex,
+of the board's real MAC address) and advertises its network shell via
+DNS-SD, so it's reachable without knowing its DHCP-assigned IP - and
+distinguishable from any other board running the same firmware.
+
+- **Unique MAC first** (`src/eth_id.c`, `set_unique_mac_address()`, called
+  before anything else in `main()`): the LAN9250's `local-mac-address` in
+  the devicetree overlay is a fixed placeholder (`00:00:00:01:02:03`) -
+  every board would otherwise get the *identical* hostname. `hwinfo_get_device_id()`
+  (`CONFIG_HWINFO=y`) returns the RP2350's real per-chip unique ID (its
+  flash's 64-bit unique RUID, read via `hardware/flash.h`'s
+  `flash_get_unique_id()` - see `hwinfo_rpi_pico.c`); the last 6 of its 8
+  bytes become the new MAC, with the locally-administered/unicast bits set
+  the same way Zephyr's own `net_eth_mac_load()`/`NET_ETH_MAC_RANDOM` path
+  does for a generated (non-IEEE-assigned) address. Applying it takes two
+  calls, both required: the driver's `set_config()` (`ETHERNET_CONFIG_TYPE_MAC_ADDRESS`)
+  reprograms the LAN9250's *hardware* RX address filter - skip this and the
+  chip keeps silently dropping inbound unicast frames addressed to the new
+  MAC - and `net_if_set_link_addr()` updates the *stack's* view (what
+  ARP/DHCP/the hostname derivation below actually see). These are called
+  directly rather than through `net_mgmt(NET_REQUEST_ETHERNET_SET_MAC_ADDRESS, ...)`:
+  that wrapper (`ethernet_mgmt.c`) refuses unless the interface is
+  administratively down first, and Zephyr brings interfaces up on their own
+  well before `main()` runs. Satisfying that would mean a
+  `net_if_down()`/`net_if_up()` cycle here - which is actively harmful:
+  `net_if_down()` unconditionally strips every multicast group membership
+  the interface holds (including mDNS's `224.0.0.251` join), and
+  `net_if_up()` never restores them. Calling the driver directly gets the
+  identical end result without ever touching admin state.
+- **Multicast RX requires promiscuous mode** (`src/eth_id.c`,
+  `enable_multicast_rx()`, called right after the MAC override):
+  `drivers/ethernet/eth_lan9250.c`'s `lan9250_configure()` never sets
+  `HMAC_CR`'s `MCPAS` (pass-all-multicast) bit, and the driver implements no
+  per-group hardware filter (`ETHERNET_CONFIG_TYPE_FILTER`) either - so by
+  default the LAN9250's own RX filter silently drops every
+  multicast-destination frame in hardware (mDNS, IGMP, everything addressed
+  to `01:00:5e:xx:xx:xx`), completely independent of anything at the
+  IP/IGMP layer. Confirmed by elevating `net_ipv4`/`net_conn` to debug
+  logging: broadcast and unicast frames reached `net_ipv4_input()` and were
+  processed normally, but not one multicast-destined frame ever arrived
+  there, even with constant mDNS/IGMP traffic on the wire. The only
+  RX-filter toggle this driver actually implements is a straight
+  promiscuous on/off switch (`ETHERNET_CONFIG_TYPE_PROMISC_MODE`), so
+  `enable_multicast_rx()` calls `net_eth_promisc_mode(iface, true)`
+  (`CONFIG_NET_PROMISCUOUS_MODE=y`) - the IP/UDP layers above still
+  correctly filter out traffic nothing is listening for, so this only
+  changes what the hardware hands up to be filtered, not what reaches
+  application sockets. A one-line driver patch (adding `MCPAS` to that
+  register write, matching what the driver's own comment already claims it
+  does) was tried instead and also works, but was rejected in favor of this
+  app-level approach: it would live outside this repo, in the west-managed
+  `~/zephyrproject/zephyr` checkout, untracked by git and liable to vanish
+  on a `west update`. Promiscuous mode does mean every frame on the LAN
+  gets examined, not just multicast ones - see "Sizing the RX buffer pool"
+  below for the consequence of that and how it's handled.
+- `CONFIG_NET_HOSTNAME_ENABLE=y` + `CONFIG_NET_HOSTNAME="stepper"` +
+  `CONFIG_NET_HOSTNAME_DYNAMIC=y` give the device a base name that can be
+  changed at runtime; `set_unique_hostname()` (`src/mdns_service.c`, called
+  right after `set_unique_mac_address()`) reads the *now-real* MAC via
+  `net_if_get_link_addr()` and appends its last 2 bytes as hex, then calls
+  `net_hostname_set()`. `CONFIG_NET_HOSTNAME_DYNAMIC` also raises
+  `NET_HOSTNAME_MAX_LEN`'s default from just `sizeof(CONFIG_NET_HOSTNAME)-1`
+  to 63, which is what actually leaves room to append those 4 hex digits -
+  without it `net_hostname_set()` would simply reject the longer string.
+  `CONFIG_MDNS_RESPONDER=y` makes the device answer mDNS queries for
+  `stepperXXXX.local` on `224.0.0.251` (IPv6 is disabled in this project, so
+  only the IPv4 multicast group is used); `mdns_responder.c` calls
+  `net_hostname_get()` fresh on every query rather than caching a
+  compile-time copy, so the runtime-set name is what's actually advertised.
+- `CONFIG_SHELL_BACKEND_TELNET=y` adds a second, independent shell backend
+  (Zephyr supports multiple simultaneous shell instances) alongside the
+  existing USB CDC-ACM one - same `stepper ...`/`net ...` commands, reachable
+  over TCP port 23 (`CONFIG_SHELL_TELNET_PORT`, the standard telnet port)
+  instead of USB.
+- `CONFIG_DNS_SD=y` + `CONFIG_MDNS_RESPONDER_DNS_SD=y` enable DNS-SD
+  (RFC 6763) service advertisement. `src/mdns_service.c` registers the
+  telnet shell as a discoverable service with a single file-scope
+  `DNS_SD_REGISTER_TCP_SERVICE(...)` declaration - no server socket code of
+  its own is needed there, since the telnet shell backend already owns its
+  own listening socket; the macro just adds a static record (placed in an
+  iterable linker section the mDNS responder scans, the same general
+  mechanism used elsewhere in Zephyr for `SHELL_CMD_REGISTER` etc.) that
+  answers PTR/SRV/TXT queries for `_telnet._tcp.local`, discoverable via
+  e.g. `avahi-browse -r _telnet._tcp` or `dns-sd -B _telnet._tcp`. Its
+  `.instance` field is a pointer to the *same* `stepper_id` buffer
+  `set_unique_hostname()` writes - a plain global array's address is a
+  valid link-time constant even though its contents are only filled in
+  later, and `dns_sd.c` calls `strlen(inst->instance)` fresh on every
+  response rather than caching it, so the DNS-SD instance name and the
+  mDNS hostname can never drift out of sync with each other.
+
+Reference: `zephyr/samples/net/mdns_responder/src/service.c` demonstrates
+the same macro family, including the ephemeral-port variant
+(`DNS_SD_REGISTER_SERVICE`) for services that don't have a fixed,
+well-known port the way telnet does.
+
+### Forcing a real IGMP join (`src/mdns_service.c`, `mdns_force_multicast_rejoin()`)
+
+`mdns_responder`'s own boot-time IGMP join for `224.0.0.251` runs at
+`SYS_INIT` priority 96 - long before the LAN9250's PHY finishes link
+negotiation (~2s post-boot). `drivers/ethernet/eth_lan9250.c`'s
+`lan9250_tx()` writes frames straight to the LAN9250's TX FIFO over SPI and
+reports success purely from that SPI transaction completing - it never
+checks `net_if_is_carrier_ok()` - so with no physical link yet, that first
+membership report is silently discarded by the hardware while
+`net_ipv4_igmp_join()` still sees `ret == 0` and marks the group "joined"
+(confirmed via the `net ipv4` shell command). That false-positive "joined"
+state then defeats both of Zephyr's built-in recovery paths for exactly
+this case: `net_if.c`'s `rejoin_ipv4_mcast_groups()` (run when the
+interface later goes operationally up for real) and `mdns_responder`'s own
+`NET_EVENT_IF_UP` handler both skip any group already marked joined, so no
+genuine report is ever retried.
+
+Worse, `net_ipv4_igmp_join()` refcounts the group entry on every call
+regardless of join state, and `mdns_responder` joins twice on its own (the
+boot-time join, then again from its `NET_EVENT_IF_UP` handler) - leaving a
+refcount of 2. A single `net_ipv4_igmp_leave()` call only decrements that;
+`net_if_ipv4_maddr_rm()` treats "count still > 0" as "still in use" and
+returns without ever clearing the joined flag or sending a Leave. So
+`mdns_force_multicast_rejoin()` drains the refcount to zero in a loop
+(`net_ipv4_igmp_leave()` until the address is actually gone) before
+rejoining - only then does the final `net_ipv4_igmp_join()` perform a real
+send. It's called from `main.c`'s existing `NET_EVENT_IPV4_ADDR_ADD`
+handler: a bound DHCP lease is independent proof the link genuinely works
+(it required real Ethernet round trips), unlike at boot.
+
+### Sizing the RX buffer pool (`prj.conf`)
+
+Promiscuous mode (above) means every frame on the LAN gets pulled over the
+LAN9250's SPI bus and examined, not just multicast ones. On a busy home LAN
+- constant mDNS chatter from several devices, Chromecast/Google Home
+discovery, SSDP, etc., with individual responses commonly running 400-650+
+bytes and arriving in bursts of several back-to-back - the default RX
+buffer pool (`NET_PKT_RX_COUNT=14` / `NET_BUF_RX_COUNT=36` at
+`NET_BUF_DATA_SIZE=128` bytes each, ~4.6KB total) empties out under
+sustained bursts. Combined with the LAN9250's slow 10MHz SPI bus (each
+frame needs a full synchronous SPI read before the next can start), this
+showed up as `Could not allocate rx buffer` in the log, badly enough to
+starve *legitimate* traffic too - ARP started failing intermittently
+(`ping`/`telnet` to the board's IP directly, not just its hostname, reported
+"Destination Host Unreachable" from the querying machine's own kernel, a
+local ARP-resolution failure).
+
+Fixed by sizing the pool generously in `prj.conf`
+(`CONFIG_NET_PKT_RX_COUNT=32`, `CONFIG_NET_BUF_RX_COUNT=128`) rather than
+trying to reduce traffic volume - RAM has plenty of headroom (~25% used of
+392KB) for this. A one-line patch to the vendored LAN9250 driver (setting
+just `HMAC_CR`'s `MCPAS` bit, so the hardware itself passes multicast only,
+not every frame on the LAN) was tried as an alternative that would have
+avoided the volume problem at its source, and does work, but was rejected:
+it would live outside this repo, in the west-managed
+`~/zephyrproject/zephyr` checkout, untracked by git and liable to silently
+vanish on a `west update`.
