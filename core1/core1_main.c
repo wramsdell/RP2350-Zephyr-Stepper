@@ -33,7 +33,7 @@
 #define ABS_MAX_SPEED 160000.0f /* steps/sec, assumes 48V DC supply */
 #define ABS_MAX_ACCEL 2666666.0f /* steps/sec^2, 10 m/s^2 slide limit */
 
-#define DEF_MAX_SPEED 160000.0f
+#define DEF_MAX_SPEED 100000.0f
 #define DEF_ACCEL     1000000.0f
 #define DEF_DECEL     1000000.0f
 
