@@ -13,6 +13,7 @@ target_sources(app PRIVATE
     src/mdns_service.c
     src/eth_id.c
     src/bootloader_shell.c
+    src/ptp_shell.c
     drivers/eth_lan9250/eth_lan9250.c
 )
 

@@ -20,6 +20,10 @@
  * error counters climbed steadily, and ARP resolution failed
  * intermittently) - a problem no amount of buffer-pool tuning fixed, since
  * it's the frame data itself arriving corrupted, not a capacity issue.
+ *
+ * Also the home of this project's IEEE 1588 (PTP) hardware clock work -
+ * see lan9250_1588_init()/lan9250_ptp_clock_read() below, and
+ * THEORY_OF_OPERATION.md's "IEEE 1588 / PTP" section for the phased plan.
  */
 #define DT_DRV_COMPAT rp2350zs_lan9250
 
@@ -33,6 +37,8 @@
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/ethernet.h>
 #include <ethernet/eth_stats.h>
+
+#include "eth_lan9250_ptp.h"
 
 #include "eth_lan9250_priv.h"
 
@@ -416,15 +422,18 @@ static int lan9250_configure(const struct device *dev)
 	/* Configure remote power management:
 	 *
 	 *   - Auto wakeup
-	 *   - Disable 1588 clock
-	 *   - Disable 1588 timestamp unit clock
 	 *   - Energy-detect
 	 *   - Wake on
 	 *   - Clear wakeon
+	 *
+	 * Deliberately NOT setting PMT_CTRL_1588_DIS/PMT_CTRL_1588_TSU_DIS
+	 * (upstream Zephyr's driver sets both unconditionally) - this
+	 * project uses the 1588 PTP hardware clock (see lan9250_1588_init()
+	 * below), which needs the 1588 clock and timestamp unit left
+	 * running.
 	 */
 	ret = lan9250_write_sys_reg(dev, LAN9250_PMT_CTRL,
-				    LAN9250_PMT_CTRL_PM_WAKE | LAN9250_PMT_CTRL_1588_DIS |
-					    LAN9250_PMT_CTRL_1588_TSU_DIS |
+				    LAN9250_PMT_CTRL_PM_WAKE |
 					    LAN9250_PMT_CTRL_WOL_EN | LAN9250_PMT_CTRL_WOL_STS);
 	if (ret < 0) {
 		return ret;
@@ -882,6 +891,220 @@ static const struct ethernet_api api_funcs = {
 	.send = lan9250_tx,
 };
 
+/*
+ * IEEE 1588 (PTP) hardware clock - Phase 1 bring-up (see
+ * THEORY_OF_OPERATION.md's "IEEE 1588 / PTP" section for the project's
+ * phased plan, and the LAN9250 datasheet Section 14.0 for the hardware
+ * this is built on). This phase only enables the clock and gets it
+ * readable; no Zephyr ptp_clock integration, GPIO event output, or
+ * network timestamping yet.
+ */
+static int lan9250_1588_init(const struct device *dev)
+{
+	int ret;
+	uint32_t general_config;
+
+	/* Enable the 1588 unit. CMD_CTL's bits are all write-1-to-trigger,
+	 * self-clearing (writing 0 to any other bit is defined as a no-op),
+	 * so a single-bit write here is safe and doesn't disturb anything
+	 * else in the register.
+	 */
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CMD_CTL, LAN9250_1588_CMD_CTL_ENABLE);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* The timestamp unit (RX/TX timestamping, not yet used by this
+	 * phase) defaults to enabled (reset value 1b), but set it
+	 * explicitly rather than relying on that - it depends on the
+	 * board's 1588_enable_strap configuration, which this project
+	 * doesn't control.
+	 */
+	ret = lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &general_config);
+	if (ret < 0) {
+		return ret;
+	}
+
+	general_config |= LAN9250_1588_GENERAL_CONFIG_TSU_ENABLE;
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, general_config);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* Load the clock to a known value (0) so early reads are
+	 * meaningful before any real time source (network PTP sync, once
+	 * implemented) has set it.
+	 */
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_SEC, 0);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_NS, 0);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CMD_CTL, LAN9250_1588_CMD_CTL_CLOCK_LOAD);
+	if (ret < 0) {
+		return ret;
+	}
+
+	LOG_INF("1588 PTP clock enabled");
+
+	return 0;
+}
+
+int lan9250_ptp_clock_read(const struct device *dev, uint32_t *sec, uint32_t *ns,
+			   uint32_t *subns)
+{
+	int ret;
+
+	/* Snapshot the live, free-running clock into CLOCK_SEC/NS/SUBNS so
+	 * they can be read back consistently (the clock keeps ticking
+	 * between the three register reads below otherwise).
+	 */
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CMD_CTL, LAN9250_1588_CMD_CTL_CLOCK_READ);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_SEC, sec);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_NS, ns);
+	if (ret < 0) {
+		return ret;
+	}
+
+	if (subns != NULL) {
+		ret = lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_SUBNS, subns);
+		if (ret < 0) {
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Phase 2: arm a 1PPS output on GPIO1 (this board's pin 46, LED1/GPIO1/
+ * TDI/MNGT1 - not connected to the RJ45's LEDs, just a 10k pull-down for
+ * the MNGT1 boot strap, so it's free to use). Uses 1588 Clock Event
+ * Channel A with a Clock Target Reload/Add of exactly 1 second in
+ * increment ("auto-repeat") mode: once armed, the hardware itself
+ * advances the Clock Target by 1s on every compare event and re-fires,
+ * indefinitely, with zero CPU involvement per pulse - jitter is bounded
+ * by the 1588 clock's own accuracy, not any software timing loop.
+ *
+ * Configured as a push/pull output, not open-drain: this board's pull
+ * resistor on GPIO1 is a pull-DOWN, and the datasheet's open-drain-plus-
+ * 1588-event behavior only ever drives the pin low or leaves it
+ * floating - with a pull-down and no pull-up, that would never actually
+ * read high on a scope. Push/pull drives a genuine, clean pulse instead.
+ *
+ * Uses "100ns pulse" event mode (not "toggle"): that's the actual PPS
+ * convention - a sharp edge marking each second boundary - rather than a
+ * 0.5Hz square wave.
+ */
+int lan9250_1588_pps_enable(const struct device *dev)
+{
+	int ret;
+	uint32_t led_cfg, gpio_cfg, general_config, sec, ns;
+
+	/* Make sure GPIO1 is in GPIO mode, not LED mode */
+	ret = lan9250_read_sys_reg(dev, LAN9250_LED_CFG, &led_cfg);
+	if (ret < 0) {
+		return ret;
+	}
+
+	led_cfg &= ~LAN9250_LED_CFG_LED_EN(1);
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_LED_CFG, led_cfg);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* GPIO1: push/pull, active-high, 1588 channel A, 1588 output
+	 * enabled (this also overrides GPIO_DATA_DIR's direction bit for
+	 * GPIO1, per the datasheet - GPIOBUF is not overridden, hence
+	 * setting it explicitly above).
+	 */
+	ret = lan9250_read_sys_reg(dev, LAN9250_GPIO_CFG, &gpio_cfg);
+	if (ret < 0) {
+		return ret;
+	}
+
+	gpio_cfg |= LAN9250_GPIO_CFG_GPIOBUF(1);
+	gpio_cfg |= LAN9250_GPIO_CFG_GPIO_POL(1);
+	gpio_cfg &= ~LAN9250_GPIO_CFG_1588_GPIO_CH_SEL(1);
+	gpio_cfg |= LAN9250_GPIO_CFG_1588_GPIO_OE(1);
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_GPIO_CFG, gpio_cfg);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* Clock Event Channel A: 100ns pulse per compare event, increment
+	 * (auto-repeat) mode rather than one-shot reload.
+	 */
+	ret = lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &general_config);
+	if (ret < 0) {
+		return ret;
+	}
+
+	general_config &= ~LAN9250_1588_GENERAL_CONFIG_CLOCK_EVENT_A_MASK;
+	general_config |= (LAN9250_1588_CLOCK_EVENT_MODE_100NS_PULSE
+			    << LAN9250_1588_GENERAL_CONFIG_CLOCK_EVENT_A_SHIFT);
+	general_config &= ~LAN9250_1588_GENERAL_CONFIG_RELOAD_ADD_A;
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, general_config);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* Reload/Add A = exactly 1 second: each compare event advances the
+	 * Clock Target by 1s, so the pulse train self-sustains forever once
+	 * armed.
+	 */
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_RELOAD_SEC(0), 1);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_RELOAD_NS(0), 0);
+	if (ret < 0) {
+		return ret;
+	}
+
+	/* Seed the initial Clock Target a couple of seconds in the future
+	 * (comfortably past this function's own remaining SPI transactions)
+	 * and aligned to a whole-second boundary, so the pulse train lines
+	 * up with the clock's own seconds tick from the very first pulse.
+	 */
+	ret = lan9250_ptp_clock_read(dev, &sec, &ns, NULL);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_SEC(0), sec + 2);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_NS(0), 0);
+	if (ret < 0) {
+		return ret;
+	}
+
+	LOG_INF("1588 PPS output armed on GPIO1 (first pulse at clock second %u)", sec + 2);
+
+	return 0;
+}
+
 static int lan9250_init(const struct device *dev)
 {
 	int ret;
@@ -960,6 +1183,12 @@ static int lan9250_init(const struct device *dev)
 	ret = lan9250_set_macaddr(dev);
 	if (ret < 0) {
 		LOG_ERR("Set mac address failed");
+		return ret;
+	}
+
+	ret = lan9250_1588_init(dev);
+	if (ret < 0) {
+		LOG_ERR("1588 PTP clock init failed");
 		return ret;
 	}
 

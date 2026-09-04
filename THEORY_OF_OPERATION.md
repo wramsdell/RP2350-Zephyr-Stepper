@@ -634,3 +634,103 @@ as cheap insurance against burst traffic, given RAM has plenty of headroom
   rose modestly (packets arriving and being dropped specifically at this
   layer, not just the generic IP layer). Fixed with
   `CONFIG_MDNS_RESOLVER_ADDITIONAL_BUF_CTR=14`.
+
+## IEEE 1588 / PTP (Core0 only)
+
+The LAN9250 has a genuinely serious hardware IEEE 1588-2008 (PTP)
+implementation - datasheet Section 14.0, ~80 pages - well beyond a simple
+free-running counter: a tunable 32-bit-seconds/30-bit-nanoseconds clock
+with load/step/rate-adjust primitives, automatic hardware RX/TX packet
+timestamping (with optional on-the-fly one-step timestamp insertion), and
+a clock-event comparator block that can drive a GPIO pin directly from
+hardware. Zephyr's upstream driver not only omits all of this, it actively
+disables the 1588 clock and timestamp unit at init (`lan9250_configure()`'s
+`PMT_CTRL` write used to include `PMT_CTRL_1588_DIS | PMT_CTRL_1588_TSU_DIS`
+- see `drivers/eth_lan9250/eth_lan9250.c`'s header comment). Implementing
+this is being done in phases, each independently testable before moving
+on:
+
+1. **Bring up the raw 1588 clock** (`lan9250_1588_init()`, `ptp clock`
+   shell command) - enable the 1588 unit and its timestamp unit, load the
+   clock to a known value (0), confirm it free-runs at a sane rate by
+   reading it twice a known interval apart. No Zephyr API integration
+   yet.
+2. **1PPS output** (`lan9250_1588_pps_enable()`, `ptp pps` shell command)
+   - a hardware-generated, self-sustaining pulse-per-second signal,
+   directly oscilloscope-observable, validating the whole clock + GPIO
+   event chain independently of any network protocol work. Done, see
+   below.
+3. **Zephyr `ptp_clock` driver integration** (not yet done) - wire
+   `CLOCK_SEC/NS/SUBNS`, `CLOCK_STEP_ADJ`, and `CLOCK_RATE_ADJ` into
+   Zephyr's standard `ptp_clock` device abstraction
+   (`.get`/`.set`/`.adjust`), exposed via the Ethernet driver's
+   `.get_ptp_clock()`, so the clock becomes usable by ordinary Zephyr
+   networking APIs independent of any PTP protocol work.
+4. **Hardware RX/TX packet timestamping** (not yet done) - enable the PTP
+   Timestamp block's ingress/egress recording for Sync/Delay_Req/PDelay
+   messages, wire captured timestamps into `net_pkt`'s timestamp fields
+   (the mechanism Zephyr's gPTP subsystem expects).
+5. **Full network PTP sync** (not yet done, stretch goal) - either
+   Zephyr's built-in gPTP (802.1AS) subsystem against the `ptp_clock`
+   driver from phase 3, or a minimal hand-rolled ordinary-clock PTP
+   client (Sync/Delay_Req exchange + servo) if gPTP doesn't fit. Milestone:
+   the 1PPS output from phase 2 tracking/locking to an external reference
+   instead of free-running.
+
+### Register access
+
+All the registers phases 1-2 need (`1588_CMD_CTL`, `1588_GENERAL_CONFIG`,
+`1588_CLOCK_SEC/NS/SUBNS`, `1588_CLOCK_RATE_ADJ`, the Clock Target/Reload
+register pairs, `GPIO_CFG`, `LED_CFG`) are plain directly-addressed system
+registers - "Bank: na" in the datasheet's Table 14-1 - reached exactly the
+same way as `PMT_CTRL` etc. elsewhere in this driver
+(`lan9250_read_sys_reg()`/`lan9250_write_sys_reg()`), no MAC-CSR
+indirection or bank-select needed. Per-port RX/TX timestamp config (Banks
+0-2) and per-GPIO capture registers (Bank 3), needed starting at phase 4,
+are reached via `1588_BANK_PORT_GPIO_SEL` and aren't used yet.
+
+One correction worth flagging for future reference: `1588_GENERAL_CONFIG`'s
+`RELOAD_ADD_A`/`RELOAD_ADD_B` bits were initially guessed at bits
+11/10 (`0x400`/`0x800`) by pattern-matching neighboring fields' scale
+without checking the actual bit table - checking the datasheet page
+directly (Section 14.8.2, page 323) before writing any code caught this:
+they're actually bits 0/1 (`0x1`/`0x2`). Left as a reminder that this
+particular datasheet's field layouts don't always follow an obvious
+pattern from one page to the next - verify against the actual bit table,
+not adjacent fields' scale.
+
+### 1PPS output (`lan9250_1588_pps_enable()`, `ptp pps`)
+
+Uses 1588 Clock Event Channel A with the Clock Target's Reload/Add
+register pair set to exactly `{1s, 0ns}` in *increment* mode
+(`GENERAL_CONFIG`'s `RELOAD_ADD_A = 0`, confusingly the opposite of what
+the name suggests - 0 means "increment the Clock Target by the Reload/Add
+value on every compare event", 1 means "reload it" - a one-shot preload,
+not what a repeating signal needs). Once armed, the LAN9250's own
+comparator advances the Clock Target by 1 second and re-fires
+indefinitely, entirely in hardware - no CPU involvement per pulse, so
+jitter is bounded only by the 1588 clock's own accuracy, not by any
+software re-arming loop.
+
+Output pin is GPIO1 (this board's pin 46, `LED1/GPIO1/TDI/MNGT1`) - unused
+by the RJ45's LEDs (those are on GPIO0/GPIO2), confirmed only a 10k
+pull-down for the `MNGT1` boot strap. That pull-down is also why the GPIO
+is configured as a **push/pull** output rather than open-drain
+(`GPIO_CFG`'s `GPIOBUF[1] = 1`): the datasheet's open-drain-plus-1588-event
+behavior only ever drives the pin low or leaves it floating, and with a
+pull-*down* (not pull-up) present, "floating" would just read low on a
+scope too - never producing an observable high pulse. Clock Event Channel
+A is set to "100ns pulse" mode rather than "toggle": that's the actual PPS
+convention (a sharp edge marking each second boundary), not a 0.5Hz square
+wave.
+
+Validated on a real board: `ptp pps` armed the output, and a scope
+confirmed a clean pulse train at very close to exactly 1 second intervals
+(measured ~4.56ppm fast on one board - well inside the crystal's own
+±40ppm datasheet tolerance, and easily correctable later via
+`CLOCK_RATE_ADJ` - bit 31 = direction, 0=slower/9ns increments,
+1=faster/11ns increments; bits 29:0 = adjustment value in units of 2⁻³²ns
+added to the 32-bit `CLOCK_SUBNS` accumulator every 10ns reference tick,
+nudging that tick's nanoseconds increment by ±1ns each time the
+accumulator overflows - not applied here since the as-shipped accuracy was
+already considered acceptable).

@@ -57,6 +57,81 @@
 #define LAN9250_MAC_CSR_DATA   0x00A8
 #define LAN9250_AFC_CFG        0x00AC
 #define LAN9250_RESET_CTL      0x01F8
+#define LAN9250_LED_CFG        0x01BC
+#define LAN9250_GPIO_CFG       0x01E0
+#define LAN9250_GPIO_DATA_DIR  0x01E4
+#define LAN9250_GPIO_INT_STS_EN 0x01E8
+
+/* LED_CFG bits (datasheet Section 16.4.1) - LED_EN(x): 0 = pin x is a
+ * plain GPIO, 1 = pin x is an LED output. x is 0/1/2 for GPIO0/1/2.
+ */
+#define LAN9250_LED_CFG_LED_EN(x) (1u << (x))
+
+/* GPIO_CFG bits (datasheet Section 16.4.2), one bit per GPIO pin unless
+ * noted. x is 0/1/2 for GPIO0/1/2.
+ */
+#define LAN9250_GPIO_CFG_1588_GPIO_CH_SEL(x) (1u << (24 + (x))) /* 0=ch A, 1=ch B */
+#define LAN9250_GPIO_CFG_GPIO_POL(x)         (1u << (16 + (x))) /* 1=active high */
+#define LAN9250_GPIO_CFG_1588_GPIO_OE(x)     (1u << (8 + (x)))  /* 1=1588 event drives pin */
+#define LAN9250_GPIO_CFG_GPIOBUF(x)          (1u << (x))        /* 1=push/pull, 0=open-drain */
+
+/*
+ * LAN9250 IEEE 1588 (PTP) registers - datasheet Section 14.8, "1588
+ * Registers". These are directly-addressed system registers ("Bank: na"
+ * in the datasheet's Table 14-1), reached the same way as PMT_CTRL etc.
+ * above (lan9250_read_sys_reg()/lan9250_write_sys_reg()) - no MAC-CSR
+ * indirection and no bank-select needed for this subset. Per-port
+ * RX/TX timestamp config (Banks 0-2) and per-GPIO capture registers
+ * (Bank 3), reached via 1588_BANK_PORT_GPIO_SEL, are not yet used here.
+ */
+#define LAN9250_1588_CMD_CTL             0x0100
+#define LAN9250_1588_GENERAL_CONFIG      0x0104
+#define LAN9250_1588_INT_STS             0x0108
+#define LAN9250_1588_INT_EN              0x010C
+#define LAN9250_1588_CLOCK_SEC           0x0110
+#define LAN9250_1588_CLOCK_NS            0x0114
+#define LAN9250_1588_CLOCK_SUBNS         0x0118
+#define LAN9250_1588_CLOCK_RATE_ADJ      0x011C
+#define LAN9250_1588_CLOCK_TEMP_RATE_ADJ 0x0120
+#define LAN9250_1588_CLOCK_TEMP_RATE_DURATION 0x0124
+#define LAN9250_1588_CLOCK_STEP_ADJ      0x0128
+/* Clock Target/Reload-Add register pairs: x=A at 0x12C.., x=B at 0x13C.. */
+#define LAN9250_1588_CLOCK_TARGET_SEC(x)        (0x012C + 0x10 * (x))
+#define LAN9250_1588_CLOCK_TARGET_NS(x)         (0x0130 + 0x10 * (x))
+#define LAN9250_1588_CLOCK_TARGET_RELOAD_SEC(x) (0x0134 + 0x10 * (x))
+#define LAN9250_1588_CLOCK_TARGET_RELOAD_NS(x)  (0x0138 + 0x10 * (x))
+/* x: 0 = channel A, 1 = channel B (datasheet uses "A"/"B" - offsets above
+ * are literal, do not use this macro for the target/reload registers). */
+
+/* 1588_CMD_CTL bits */
+#define LAN9250_1588_CMD_CTL_CLOCK_TARGET_READ 0x00002000
+#define LAN9250_1588_CMD_CTL_CLOCK_TEMP_RATE   0x00000080
+#define LAN9250_1588_CMD_CTL_CLOCK_STEP_NS     0x00000040
+#define LAN9250_1588_CMD_CTL_CLOCK_STEP_SEC    0x00000020
+#define LAN9250_1588_CMD_CTL_CLOCK_LOAD        0x00000010
+#define LAN9250_1588_CMD_CTL_CLOCK_READ        0x00000008
+#define LAN9250_1588_CMD_CTL_ENABLE            0x00000004
+#define LAN9250_1588_CMD_CTL_DISABLE           0x00000002
+#define LAN9250_1588_CMD_CTL_RESET             0x00000001
+
+/* 1588_GENERAL_CONFIG bits.
+ *
+ * RELOAD_ADD_A/B polarity per the datasheet is the opposite of what the
+ * names suggest at a glance: 0 = increment the Clock Target by the
+ * Reload/Add registers on every compare event (auto-repeating - what a
+ * free-running PPS output needs), 1 = reload the Clock Target from the
+ * Reload/Add registers on the next event (a one-shot pre-load).
+ */
+#define LAN9250_1588_GENERAL_CONFIG_TSU_ENABLE      0x00010000
+#define LAN9250_1588_GENERAL_CONFIG_RELOAD_ADD_B    0x00000002
+#define LAN9250_1588_GENERAL_CONFIG_RELOAD_ADD_A    0x00000001
+#define LAN9250_1588_GENERAL_CONFIG_CLOCK_EVENT_B_MASK 0x00000030
+#define LAN9250_1588_GENERAL_CONFIG_CLOCK_EVENT_B_SHIFT 4
+#define LAN9250_1588_GENERAL_CONFIG_CLOCK_EVENT_A_MASK 0x0000000C
+#define LAN9250_1588_GENERAL_CONFIG_CLOCK_EVENT_A_SHIFT 2
+#define LAN9250_1588_CLOCK_EVENT_MODE_100NS_PULSE 0x0
+#define LAN9250_1588_CLOCK_EVENT_MODE_TOGGLE      0x1
+#define LAN9250_1588_CLOCK_EVENT_MODE_INT_BIT     0x2
 
 /* LAN9250 Host MAC registers */
 #define LAN9250_HMAC_CR       0x01

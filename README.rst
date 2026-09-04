@@ -44,9 +44,11 @@ Hardware
   - TX (MOSI): GP19
   - RX (MISO): GP16
   - INT: GP20
-  - RESET: GP22 (currently unused — the ``microchip,lan9250`` devicetree
-    binding in this Zephyr version doesn't support a ``reset-gpios``
-    property; see the overlay for details)
+  - RESET: GP22 (drives a real hardware reset pulse on every boot via
+    this project's forked LAN9250 driver/binding - see
+    ``drivers/eth_lan9250/``)
+  - 1588 GPIO1 (LAN9250 pin 46): 1PPS output, see "IEEE 1588 / PTP"
+    below
 - Step/direction stepper motor driver, driven entirely by Core1:
 
   - Enable: GP13 (active low)
@@ -95,6 +97,24 @@ Shell commands
    stepper movein <in>    trapezoidal move, inches; +forward/-reverse
    stepper stop           request stop at next step boundary
    stepper status         current settings and motion state
+
+   bootloader             reboot into the RP2350 USB bootloader (RPI-RP2), for reflashing
+   reset                  reboot back into the flashed application
+
+   ptp clock               read the LAN9250's 1588 hardware clock (twice, ~200ms apart)
+   ptp pps                  arm a 1PPS output on GPIO1 (LAN9250 pin 46)
+
+IEEE 1588 / PTP
+****************
+
+The LAN9250 has a full IEEE 1588-2008 (PTP) hardware clock, which this
+project is bringing up in phases - a genuinely serious implementation (a
+tunable clock, hardware RX/TX packet timestamping, GPIO event output), not
+just a counter. So far: the clock itself (``ptp clock``) and a
+hardware-generated 1PPS output on GPIO1, LAN9250 pin 46 (``ptp pps``) -
+validated on real hardware with an oscilloscope. See "IEEE 1588 / PTP" in
+`THEORY_OF_OPERATION.md <THEORY_OF_OPERATION.md>`_ for the full phased
+plan and hardware details.
 
 Notes
 *****
