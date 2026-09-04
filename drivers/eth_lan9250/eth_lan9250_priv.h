@@ -103,6 +103,26 @@
 /* x: 0 = channel A, 1 = channel B (datasheet uses "A"/"B" - offsets above
  * are literal, do not use this macro for the target/reload registers). */
 
+/* 1588_CLOCK_RATE_ADJ bits (permanent rate trim). Bits 29:0 are added to
+ * the 32-bit CLOCK_SUBNS accumulator every 10ns reference tick; each time
+ * it overflows, that tick's nanoseconds increment is nudged by +-1ns
+ * instead of the normal 10ns.
+ */
+#define LAN9250_1588_CLOCK_RATE_ADJ_DIR        0x80000000 /* 0=slower(9ns), 1=faster(11ns) */
+#define LAN9250_1588_CLOCK_RATE_ADJ_VALUE_MASK 0x3FFFFFFF
+
+/* 1588_CLOCK_STEP_ADJ bits (one-time step). DIR applies to both the
+ * seconds- and nanoseconds-portion step commands in 1588_CMD_CTL, but
+ * per the datasheet only addition (DIR=1) is supported for the
+ * nanoseconds portion - subtraction (DIR=0) is only meaningful for the
+ * seconds-portion step. For the ns-portion step, VALUE replaces (not
+ * adds to) that one tick's normal ~10ns increment - to get an exact net
+ * step of +X ns, write VALUE = X + 10. For the seconds-portion step,
+ * only the low 4 bits of VALUE are used (max +-15s per step).
+ */
+#define LAN9250_1588_CLOCK_STEP_ADJ_DIR        0x80000000 /* 0=subtracted, 1=added */
+#define LAN9250_1588_CLOCK_STEP_ADJ_VALUE_MASK 0x3FFFFFFF
+
 /* 1588_CMD_CTL bits */
 #define LAN9250_1588_CMD_CTL_CLOCK_TARGET_READ 0x00002000
 #define LAN9250_1588_CMD_CTL_CLOCK_TEMP_RATE   0x00000080
@@ -401,6 +421,16 @@ struct lan9250_runtime {
 	struct k_sem tx_rx_sem;
 	struct k_sem int_sem;
 	uint8_t buf[NET_ETH_MAX_FRAME_SIZE];
+
+	/* Set once, by the separate ptp_clock device's own init function
+	 * (drivers/eth_lan9250/ptp_clock_lan9250.c) - not devicetree-backed,
+	 * so it can't reach this device by phandle, and instead stashes a
+	 * pointer to itself here (mirroring Zephyr's own
+	 * drivers/ethernet/eth_stm32_hal_ptp.c) so lan9250_get_ptp_clock()
+	 * (this driver's ethernet_api .get_ptp_clock callback) has
+	 * something to return.
+	 */
+	const struct device *ptp_clock;
 };
 
 #endif /*_LAN9250_*/

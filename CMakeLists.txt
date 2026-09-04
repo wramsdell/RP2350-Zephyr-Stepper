@@ -15,6 +15,7 @@ target_sources(app PRIVATE
     src/bootloader_shell.c
     src/ptp_shell.c
     drivers/eth_lan9250/eth_lan9250.c
+    drivers/eth_lan9250/ptp_clock_lan9250.c
 )
 
 include(cmake/core1.cmake)

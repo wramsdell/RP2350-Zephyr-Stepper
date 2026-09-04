@@ -31,6 +31,7 @@
 #include <zephyr/device.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/net/net_pkt.h>
@@ -884,11 +885,26 @@ static int lan9250_set_config(const struct device *dev, enum ethernet_config_typ
 	return -ENOTSUP;
 }
 
+/*
+ * Returns the separate ptp_clock device wrapping this driver's 1588
+ * clock, once drivers/eth_lan9250/ptp_clock_lan9250.c's own init has run
+ * and stashed itself into context->ptp_clock (see the comment on that
+ * field in eth_lan9250_priv.h). NULL before that (or if PTP support
+ * isn't built in), matching this callback's documented contract.
+ */
+static const struct device *lan9250_get_ptp_clock(const struct device *dev)
+{
+	struct lan9250_runtime *context = dev->data;
+
+	return context->ptp_clock;
+}
+
 static const struct ethernet_api api_funcs = {
 	.iface_api.init = lan9250_iface_init,
 	.get_capabilities = lan9250_get_capabilities,
 	.set_config = lan9250_set_config,
 	.send = lan9250_tx,
+	.get_ptp_clock = lan9250_get_ptp_clock,
 };
 
 /*
@@ -988,6 +1004,93 @@ int lan9250_ptp_clock_read(const struct device *dev, uint32_t *sec, uint32_t *ns
 	}
 
 	return 0;
+}
+
+/*
+ * Phase 3: register-level primitives backing this driver's ptp_clock
+ * device (drivers/eth_lan9250/ptp_clock_lan9250.c) - see
+ * THEORY_OF_OPERATION.md's "IEEE 1588 / PTP" section.
+ */
+
+int lan9250_ptp_clock_set(const struct device *dev, uint32_t sec, uint32_t ns)
+{
+	int ret;
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_SEC, sec);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_NS, ns);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return lan9250_write_sys_reg(dev, LAN9250_1588_CMD_CTL, LAN9250_1588_CMD_CTL_CLOCK_LOAD);
+}
+
+/*
+ * Applies a one-time step of increment_ns nanoseconds (either sign, any
+ * magnitude) to the clock. Implemented as a plain read-modify-write
+ * (CLOCK_READ, adjust in software, CLOCK_LOAD) rather than the hardware's
+ * single-tick CLOCK_STEP_ADJ/CMD_CTL mechanism: that mechanism only
+ * supports subtraction via its seconds-portion step (addition-only for
+ * the nanoseconds portion, per the datasheet), which would need
+ * nanosecond/second-borrow composition to support arbitrary signed
+ * nanosecond steps correctly. The read-modify-write approach is trivially
+ * correct for any increment_ns value at the cost of the sub-tick timing
+ * precision the hardware mechanism would otherwise offer - an acceptable
+ * trade for the step sizes a PTP servo actually uses (dwarfed by normal
+ * SPI transaction latency anyway).
+ */
+int lan9250_ptp_clock_adjust(const struct device *dev, int32_t increment_ns)
+{
+	int ret;
+	uint32_t sec, ns;
+	int64_t total_ns;
+
+	ret = lan9250_ptp_clock_read(dev, &sec, &ns, NULL);
+	if (ret < 0) {
+		return ret;
+	}
+
+	total_ns = (int64_t)ns + increment_ns;
+	sec += (uint32_t)(total_ns / 1000000000LL);
+	total_ns %= 1000000000LL;
+
+	if (total_ns < 0) {
+		total_ns += 1000000000LL;
+		sec -= 1;
+	}
+
+	return lan9250_ptp_clock_set(dev, sec, (uint32_t)total_ns);
+}
+
+/*
+ * Applies a permanent rate trim, as a ratio relative to nominal (1.0 =
+ * unadjusted, >1.0 = faster, <1.0 = slower) - the same convention
+ * Zephyr's ptp_clock_driver_api.rate_adjust() uses, so this doubles as
+ * its direct implementation. See eth_lan9250_priv.h's
+ * LAN9250_1588_CLOCK_RATE_ADJ_* comment for the register's units.
+ */
+int lan9250_ptp_clock_rate_adjust(const struct device *dev, double ratio)
+{
+	double ppb = (ratio - 1.0) * 1.0e9;
+	uint64_t magnitude;
+	uint32_t rate_adj;
+
+	magnitude = (uint64_t)(llround((ppb < 0 ? -ppb : ppb) * 42.94967296));
+
+	if (magnitude > LAN9250_1588_CLOCK_RATE_ADJ_VALUE_MASK) {
+		return -ERANGE;
+	}
+
+	rate_adj = (uint32_t)magnitude;
+	if (ppb >= 0) {
+		rate_adj |= LAN9250_1588_CLOCK_RATE_ADJ_DIR;
+	}
+
+	return lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, rate_adj);
 }
 
 /*

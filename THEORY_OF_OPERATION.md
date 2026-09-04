@@ -25,6 +25,9 @@ rpi_pico2_rp2350a_m33.overlay  Devicetree: SRAM split, mbox, LAN9250, USB consol
 
 drivers/eth_lan9250/           Project-owned fork of Zephyr's LAN9250 driver
                                 (see "Forked LAN9250 driver" below)
+  eth_lan9250_ptp.h            Public API: LAN9250 1588 clock + PPS (see
+                                "IEEE 1588 / PTP" below)
+  ptp_clock_lan9250.c           Zephyr ptp_clock device wrapping the 1588 clock
 dts/bindings/ethernet/         Devicetree binding matching the forked driver's
                                 renamed compatible string
 
@@ -41,6 +44,10 @@ src/                           Core0 (Zephyr) application sources
                                 "Network discovery" below)
   mdns_service.c / .h          mDNS hostname + DNS-SD advertisement (see
                                 "Network discovery" below)
+  bootloader_shell.c           `bootloader`/`reset` shell commands (no
+                                physical BOOTSEL button needed to reflash)
+  ptp_shell.c                  `ptp clock`/`ptp pps` shell commands (see
+                                "IEEE 1588 / PTP" below)
 
 core1/                         Bare-metal core1 image sources (NOT Zephyr)
   linker.ld                    Flat linker script; must match the SRAM
@@ -660,12 +667,13 @@ on:
    directly oscilloscope-observable, validating the whole clock + GPIO
    event chain independently of any network protocol work. Done, see
    below.
-3. **Zephyr `ptp_clock` driver integration** (not yet done) - wire
-   `CLOCK_SEC/NS/SUBNS`, `CLOCK_STEP_ADJ`, and `CLOCK_RATE_ADJ` into
-   Zephyr's standard `ptp_clock` device abstraction
-   (`.get`/`.set`/`.adjust`), exposed via the Ethernet driver's
-   `.get_ptp_clock()`, so the clock becomes usable by ordinary Zephyr
-   networking APIs independent of any PTP protocol work.
+3. **Zephyr `ptp_clock` driver integration**
+   (`drivers/eth_lan9250/ptp_clock_lan9250.c`) - wire `CLOCK_SEC/NS`,
+   `CLOCK_STEP_ADJ`, and `CLOCK_RATE_ADJ` into Zephyr's standard
+   `ptp_clock` device abstraction (`.get`/`.set`/`.adjust`/
+   `.rate_adjust`), exposed via the Ethernet driver's `.get_ptp_clock()`,
+   so the clock becomes usable by ordinary Zephyr networking APIs
+   independent of any PTP protocol work. Done, see below.
 4. **Hardware RX/TX packet timestamping** (not yet done) - enable the PTP
    Timestamp block's ingress/egress recording for Sync/Delay_Req/PDelay
    messages, wire captured timestamps into `net_pkt`'s timestamp fields
@@ -734,3 +742,55 @@ added to the 32-bit `CLOCK_SUBNS` accumulator every 10ns reference tick,
 nudging that tick's nanoseconds increment by ±1ns each time the
 accumulator overflows - not applied here since the as-shipped accuracy was
 already considered acceptable).
+
+### Zephyr `ptp_clock` driver integration (`drivers/eth_lan9250/ptp_clock_lan9250.c`)
+
+Zephyr's `ptp_clock_driver_api` (`.set`/`.get`/`.adjust`/`.rate_adjust`) is
+implemented by a **separate, non-devicetree-backed `struct device`**, not
+by the LAN9250 Ethernet device itself - a `struct device` has exactly one
+`.api` vtable, and the LAN9250's is already `ethernet_api`. This mirrors
+Zephyr's own `drivers/ethernet/eth_stm32_hal_ptp.c`, which has the
+identical problem (an internal-to-the-MAC PTP clock, no separate physical
+block to bind a devicetree node to): a plain `DEVICE_DEFINE()` with no
+devicetree node at all, whose init function reaches into the Ethernet
+driver's own runtime data and stashes a pointer to itself there
+(`lan9250_runtime::ptp_clock`), so `eth_lan9250.c`'s `.get_ptp_clock`
+callback has something to return. Register-level operations
+(`lan9250_ptp_clock_set/adjust/rate_adjust()`) live in `eth_lan9250.c`
+itself, next to `lan9250_ptp_clock_read()` from phase 1, since they need
+the driver's private `lan9250_read_sys_reg()`/`lan9250_write_sys_reg()`;
+`ptp_clock_lan9250.c` is just the thin API-shape adapter.
+
+One real pitfall hit here: `DEVICE_DEFINE()`'s init-priority argument is
+used in preprocessor token-pasting to build the init-level linker section
+name, so it must be a literal integer token - `CONFIG_ETH_INIT_PRIORITY + 1`
+(intended to just mean "sometime after the Ethernet driver's own init")
+compiles fine but fails at *link* time with a cryptic `Undefined
+initialization levels used` error. Fixed by hardcoding the literal `61`
+(one past `CONFIG_ETH_INIT_PRIORITY=60`) with a comment explaining why -
+same category of "looks like it should work, only breaks visibly at a
+much later build step" issue as the `RELOAD_ADD_A/B` bit-position mistake
+above.
+
+`.adjust()` (a signed nanosecond step, any magnitude) is implemented as a
+plain software read-modify-write (`CLOCK_READ`, adjust in software,
+`CLOCK_LOAD`) rather than the hardware's single-tick `CLOCK_STEP_ADJ`
+mechanism: that mechanism only supports subtraction via its
+seconds-portion step (the nanoseconds-portion step is addition-only, per
+the datasheet), which would need explicit nanosecond/second-borrow
+composition to support arbitrary signed steps correctly. The
+read-modify-write approach is trivially correct for any `increment_ns`
+value, at the cost of the sub-tick timing precision the hardware
+mechanism would otherwise offer - an acceptable trade for the step sizes
+a PTP servo actually uses, which are dwarfed by normal SPI transaction
+latency anyway.
+
+`CONFIG_PTP_CLOCK_SHELL=y` gives a generic `ptp_clock get/set/adj/freq/
+selftest <device>` shell interface for free (device name is
+`PTP_CLOCK_NAME`, i.e. `"PTP_CLOCK"`) - used for testing `.set`/
+`.adjust`/`.rate_adjust` instead of hand-writing equivalents ourselves.
+Note a small upstream (Zephyr) documentation bug encountered while
+testing: `ptp_clock adj <device> <value>`'s help text says `<seconds>`,
+but the value is actually nanoseconds (it calls `ptp_clock_adjust()`
+directly, whose own doc comment says nanoseconds) - not this project's
+bug, just worth knowing when testing.
