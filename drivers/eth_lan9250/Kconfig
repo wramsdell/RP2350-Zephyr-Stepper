@@ -1,0 +1,43 @@
+# Project-local fork of Zephyr's drivers/ethernet/Kconfig.lan9250, renamed
+# to avoid any symbol collision with the (unused, since our devicetree node
+# uses the "rp2350zs,lan9250" compatible instead of "microchip,lan9250")
+# upstream driver's own Kconfig.
+
+# Copyright (c) 2024 Mario Paja
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig RP2350ZS_ETH_LAN9250
+	bool "LAN9250 Ethernet Controller (project-local fork)"
+	default y
+	depends on DT_HAS_RP2350ZS_LAN9250_ENABLED
+	select SPI
+	help
+	  LAN9250 Stand-Alone Ethernet Controller with SPI Interface -
+	  project-local fork of Zephyr's upstream driver, see
+	  drivers/eth_lan9250/eth_lan9250.c for why.
+
+if RP2350ZS_ETH_LAN9250
+
+config RP2350ZS_ETH_LAN9250_RX_THREAD_STACK_SIZE
+	int "Stack size for internal incoming packet handler"
+	default 800
+	help
+	  Size of the stack used for internal thread which is ran for
+	  incoming packet processing.
+
+config RP2350ZS_ETH_LAN9250_RX_THREAD_PRIO
+	int "Priority for internal incoming packet handler"
+	default 2
+	help
+	  Priority level for internal thread which is ran for incoming
+	  packet processing.
+
+config RP2350ZS_ETH_LAN9250_BUF_ALLOC_TIMEOUT
+	int "Network buffer allocation timeout"
+	default 100
+	help
+	  Given timeout in milliseconds. Maximum amount of time
+	  that the driver will wait from the IP stack to get
+	  a memory buffer before the Ethernet frame is dropped.
+
+endif # RP2350ZS_ETH_LAN9250

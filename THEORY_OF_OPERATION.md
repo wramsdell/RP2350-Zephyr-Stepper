@@ -17,10 +17,16 @@ Core1's actual workload, and the mailbox protocol that controls it, are new
 
 ```
 CMakeLists.txt                 Top-level app build; wires core1's build in
+Kconfig                        App-root Kconfig; sources drivers/eth_lan9250/Kconfig
 cmake/core1.cmake              Cross-compiles + embeds the core1 image
 cmake/pioasm.cmake             Builds pioasm as a native host tool (see below)
 prj.conf                       Core0 (Zephyr) Kconfig
 rpi_pico2_rp2350a_m33.overlay  Devicetree: SRAM split, mbox, LAN9250, USB console
+
+drivers/eth_lan9250/           Project-owned fork of Zephyr's LAN9250 driver
+                                (see "Forked LAN9250 driver" below)
+dts/bindings/ethernet/         Devicetree binding matching the forked driver's
+                                renamed compatible string
 
 src/                           Core0 (Zephyr) application sources
   main.c                       Calls core1_launch() + stepper_mbox_init(), then
@@ -31,6 +37,10 @@ src/                           Core0 (Zephyr) application sources
                                 (via #include <core1_blob.bin.inc>, generated
                                 at build time - see "Build & load" below)
   stepper_shell.c / .h         mbox client + the `stepper ...` shell commands
+  eth_id.c / .h                Per-board unique MAC from hwinfo (see
+                                "Network discovery" below)
+  mdns_service.c / .h          mDNS hostname + DNS-SD advertisement (see
+                                "Network discovery" below)
 
 core1/                         Bare-metal core1 image sources (NOT Zephyr)
   linker.ld                    Flat linker script; must match the SRAM
@@ -390,32 +400,14 @@ distinguishable from any other board running the same firmware.
   the interface holds (including mDNS's `224.0.0.251` join), and
   `net_if_up()` never restores them. Calling the driver directly gets the
   identical end result without ever touching admin state.
-- **Multicast RX requires promiscuous mode** (`src/eth_id.c`,
-  `enable_multicast_rx()`, called right after the MAC override):
-  `drivers/ethernet/eth_lan9250.c`'s `lan9250_configure()` never sets
-  `HMAC_CR`'s `MCPAS` (pass-all-multicast) bit, and the driver implements no
-  per-group hardware filter (`ETHERNET_CONFIG_TYPE_FILTER`) either - so by
-  default the LAN9250's own RX filter silently drops every
+- **Multicast RX needs a driver fix** - see "Forked LAN9250 driver" below.
+  Without it, the LAN9250's own RX filter silently drops every
   multicast-destination frame in hardware (mDNS, IGMP, everything addressed
   to `01:00:5e:xx:xx:xx`), completely independent of anything at the
-  IP/IGMP layer. Confirmed by elevating `net_ipv4`/`net_conn` to debug
+  IP/IGMP layer - confirmed by elevating `net_ipv4`/`net_conn` to debug
   logging: broadcast and unicast frames reached `net_ipv4_input()` and were
   processed normally, but not one multicast-destined frame ever arrived
-  there, even with constant mDNS/IGMP traffic on the wire. The only
-  RX-filter toggle this driver actually implements is a straight
-  promiscuous on/off switch (`ETHERNET_CONFIG_TYPE_PROMISC_MODE`), so
-  `enable_multicast_rx()` calls `net_eth_promisc_mode(iface, true)`
-  (`CONFIG_NET_PROMISCUOUS_MODE=y`) - the IP/UDP layers above still
-  correctly filter out traffic nothing is listening for, so this only
-  changes what the hardware hands up to be filtered, not what reaches
-  application sockets. A one-line driver patch (adding `MCPAS` to that
-  register write, matching what the driver's own comment already claims it
-  does) was tried instead and also works, but was rejected in favor of this
-  app-level approach: it would live outside this repo, in the west-managed
-  `~/zephyrproject/zephyr` checkout, untracked by git and liable to vanish
-  on a `west update`. Promiscuous mode does mean every frame on the LAN
-  gets examined, not just multicast ones - see "Sizing the RX buffer pool"
-  below for the consequence of that and how it's handled.
+  there, even with constant mDNS/IGMP traffic on the wire.
 - `CONFIG_NET_HOSTNAME_ENABLE=y` + `CONFIG_NET_HOSTNAME="stepper"` +
   `CONFIG_NET_HOSTNAME_DYNAMIC=y` give the device a base name that can be
   changed at runtime; `set_unique_hostname()` (`src/mdns_service.c`, called
@@ -487,30 +479,158 @@ send. It's called from `main.c`'s existing `NET_EVENT_IPV4_ADDR_ADD`
 handler: a bound DHCP lease is independent proof the link genuinely works
 (it required real Ethernet round trips), unlike at boot.
 
-### Sizing the RX buffer pool (`prj.conf`)
+### Forked LAN9250 driver (`drivers/eth_lan9250/`)
 
-Promiscuous mode (above) means every frame on the LAN gets pulled over the
-LAN9250's SPI bus and examined, not just multicast ones. On a busy home LAN
-- constant mDNS chatter from several devices, Chromecast/Google Home
-discovery, SSDP, etc., with individual responses commonly running 400-650+
-bytes and arriving in bursts of several back-to-back - the default RX
-buffer pool (`NET_PKT_RX_COUNT=14` / `NET_BUF_RX_COUNT=36` at
-`NET_BUF_DATA_SIZE=128` bytes each, ~4.6KB total) empties out under
-sustained bursts. Combined with the LAN9250's slow 10MHz SPI bus (each
-frame needs a full synchronous SPI read before the next can start), this
-showed up as `Could not allocate rx buffer` in the log, badly enough to
-starve *legitimate* traffic too - ARP started failing intermittently
-(`ping`/`telnet` to the board's IP directly, not just its hostname, reported
-"Destination Host Unreachable" from the querying machine's own kernel, a
-local ARP-resolution failure).
+**Two approaches to multicast RX were tried before landing here.**
 
-Fixed by sizing the pool generously in `prj.conf`
-(`CONFIG_NET_PKT_RX_COUNT=32`, `CONFIG_NET_BUF_RX_COUNT=128`) rather than
-trying to reduce traffic volume - RAM has plenty of headroom (~25% used of
-392KB) for this. A one-line patch to the vendored LAN9250 driver (setting
-just `HMAC_CR`'s `MCPAS` bit, so the hardware itself passes multicast only,
-not every frame on the LAN) was tried as an alternative that would have
-avoided the volume problem at its source, and does work, but was rejected:
-it would live outside this repo, in the west-managed
-`~/zephyrproject/zephyr` checkout, untracked by git and liable to silently
-vanish on a `west update`.
+The first was app-level: put the whole interface into full promiscuous
+mode (`net_eth_promisc_mode()`), since that's the only RX-filter toggle
+Zephyr's upstream `eth_lan9250.c` driver actually implements
+(`ETHERNET_CONFIG_TYPE_PROMISC_MODE` - there's no per-group hardware
+filter support, and the driver doesn't advertise `ETHERNET_HW_FILTERING`,
+so the generic multicast-join hardware-filter hook in `ethernet.c` never
+even calls into it). This worked initially, but on this LAN's real traffic
+volume - constant mDNS chatter from several devices, Chromecast/Google
+Home discovery, SSDP, etc. - it caused two escalating problems:
+
+1. Every frame on the LAN (not just multicast ones) raised an RX
+   interrupt and got pulled over the LAN9250's slow 10MHz SPI bus, which
+   exhausted the default `net_pkt` RX buffer pool under sustained bursts
+   (`Could not allocate rx buffer` in the log). Sizing the pool generously
+   in `prj.conf` (`CONFIG_NET_PKT_RX_COUNT`/`CONFIG_NET_BUF_RX_COUNT`,
+   still in place today - see below) fixed *that* symptom.
+2. But it recurred anyway under sustained (not just bursty) traffic, and
+   `net stats` told a different story the second time: `IPv4 recv` stayed
+   flat while `IP vhlerr`/`protoer` (header-version and protocol-field
+   validation errors) climbed and `Processing err` sat in the thousands -
+   i.e. frames were arriving *corrupted*, not just too numerous to buffer.
+   ARP resolution failed intermittently as a result (`ping`/`telnet`
+   directly to the board's IP reported "Destination Host Unreachable" from
+   the querying machine's own kernel - a local ARP-resolution failure, and
+   `arp -n` showed `(incomplete)`). The likely mechanism: promiscuous mode
+   raises an RX interrupt for *every* frame on the LAN, and the driver's
+   single RX thread (`lan9250_thread()`, shared between PHY-link
+   interrupts and FIFO draining) doing a new frame's multi-step SPI FIFO
+   read while a previous one is still mid-flight can desync the LAN9250's
+   FIFO byte stream - no amount of software-side buffer sizing fixes
+   corrupted frame *data*.
+
+That pointed at reducing traffic at the hardware source instead of trying
+to out-buffer it: `HMAC_CR`'s `MCPAS` (pass-all-multicast) bit. The
+driver's own comment right above its `HMAC_CR` init write already claims
+"Pass all multicast frames" / "Hash filtering disabled" - but the code
+never actually sets `MCPAS`, so that comment describes intent, not what
+the register write does. Setting it (multicast only, not every frame on
+the LAN) cuts the interrupt rate at the source rather than trying to
+survive it in software.
+
+The straightforward way to apply that is a one-line patch to Zephyr's
+vendored driver - but that file lives in the west-managed
+`~/zephyrproject/zephyr` checkout, outside this repo, untracked by git,
+and liable to silently vanish on a `west update`. That's a real cost for
+a single MCPAS bit; it stops being one once real driver-level work is
+needed. And there's a second reason to own this driver anyway: this
+project may eventually want the LAN9250's hardware IEEE 1588/PTP
+timestamping unit (an extensive hardware block - ~80 pages of the
+datasheet, Section 14.0), and Zephyr's driver doesn't just omit PTP
+support, it actively disables the 1588 clock and timestamp unit at init
+(`lan9250_configure()`'s `PMT_CTRL` write includes `1588_DIS |
+1588_TSU_DIS`). Implementing that would mean substantial changes to this
+driver regardless - real PTP support isn't tracked here yet, but when it
+happens, having a git-tracked, project-owned copy to build on beats
+carrying an ever-growing untracked patch against the west tree.
+
+So `drivers/eth_lan9250/` is a full fork of Zephyr's
+`drivers/ethernet/eth_lan9250.c`/`eth_lan9250_priv.h`, kept as a
+minimal-diff copy (same structure, same register-level logic) with:
+- `MCPAS` added to the `HMAC_CR` init write (the actual fix).
+- `DT_DRV_COMPAT` renamed from `microchip_lan9250` to `rp2350zs_lan9250`,
+  matching a new devicetree binding
+  (`dts/bindings/ethernet/rp2350zs,lan9250.yaml`, itself a renamed copy of
+  the upstream binding) and the overlay's `compatible = "rp2350zs,lan9250"`
+  (`rpi_pico2_rp2350a_m33.overlay`). This - not disabling the upstream
+  driver - is what keeps the two from colliding: with no devicetree node
+  using `compatible = "microchip,lan9250"` any more, Zephyr's upstream
+  driver (still present, untouched, in the west tree) simply never binds
+  to anything and isn't compiled in.
+- The three driver-specific Kconfig options renamed to
+  `CONFIG_RP2350ZS_ETH_LAN9250_*` (`drivers/eth_lan9250/Kconfig`, a
+  similarly renamed copy of upstream's `Kconfig.lan9250`), avoiding any
+  ambiguity with the (inert) upstream symbols of the same shape.
+
+Wired into the build like any other app source
+(`target_sources(app PRIVATE drivers/eth_lan9250/eth_lan9250.c ...)` in
+`CMakeLists.txt`) plus an app-root `Kconfig` file
+(`rsource "drivers/eth_lan9250/Kconfig"` then `source "Kconfig.zephyr"` -
+Zephyr auto-detects a `Kconfig` file at the application root; see the
+Kconfig section of `doc/develop/application/index.rst` in the Zephyr
+tree). No `ZEPHYR_EXTRA_MODULES`/west module machinery needed for a
+single driver used by one app.
+
+Owning the binding also unlocked two follow-on fixes that the upstream
+`microchip,lan9250.yaml` binding couldn't accommodate:
+
+- **SPI clock raised from 10MHz to 25MHz**
+  (`rpi_pico2_rp2350a_m33.overlay`'s `spi-max-frequency`). Datasheet TABLE
+  10-3 "SPI/SQI Timing Values" caps `f_sck` at 80MHz for writes/Dual/Quad
+  SIO instructions but only 30MHz for single-line Read instructions (Note
+  3) - and this driver uses single-line reads exclusively (RX FIFO pulls,
+  register polling), so 30MHz is the real ceiling. 25MHz leaves some
+  margin below that for this hand-wired setup. (An RP2350 SPI0 quirk
+  worth noting: `&spi0`'s own `clock-frequency` devicetree property looks
+  like it might cap this, but it's actually inert - `spi_pl022.c`, the
+  driver backing this SoC's SPI controller, queries the real peripheral
+  clock at runtime via `clock_control_get_rate()` and never reads that
+  property at all; only the LAN9250 child node's `spi-max-frequency`
+  matters.)
+- **Real hardware reset on every boot, not just power-on**
+  (`reset-gpios` added to `dts/bindings/ethernet/rp2350zs,lan9250.yaml`,
+  then wired to GP22 in the overlay). `eth_lan9250.c`'s `lan9250_init()`
+  already had a complete, correctly-timed reset-pulse implementation
+  (`config->reset.port != NULL` gate, driving GP22 low for 250us then
+  waiting 20ms - matching LAN9250 datasheet Section 19.6.3's t_rstia/t_cfg
+  timing) - it just never ran, because the upstream binding this project
+  forked never declared `reset-gpios` as a valid property, so the overlay
+  could only leave it commented out (see the overlay's git history) with
+  no way to enable it. The symptom without it: reflashing over USB resets
+  the RP2350 but not the LAN9250 itself (a warm MCU reset isn't a power
+  cycle for a separate chip on the board), so the LAN9250 could retain
+  state from its previous boot and Zephyr's own init sequence could fail
+  against it - observed as `eth_id: net_if_set_link_addr() failed (-1)`
+  on boot, requiring a manual power cycle to clear. Adding the property to
+  this project's own binding and pointing it at the already-wired GP22
+  (previously dead code, a commented-out `gpio-hog` block that only ever
+  released reset once at cold power-on) activates the driver's existing
+  logic with no driver-code changes at all.
+
+### Sizing the buffer pools (`prj.conf`)
+
+Even with multicast-only RX (not full promiscuous mode), this LAN is
+genuinely chatty across many multicast groups - mDNS from several devices,
+Chromecast/Google Home discovery, SSDP, etc., not just our own
+`224.0.0.251` traffic - with responses commonly running 400-650+ bytes and
+arriving in bursts of several back-to-back. Combined with the LAN9250's
+slow 10MHz SPI bus (each frame needs a full synchronous SPI read before
+the next can start), two buffer pools are sized generously in `prj.conf`
+as cheap insurance against burst traffic, given RAM has plenty of headroom
+(~25% used of 392KB):
+
+- The generic `net_pkt` RX pool (`CONFIG_NET_PKT_RX_COUNT=32`,
+  `CONFIG_NET_BUF_RX_COUNT=128` vs. defaults of 14/36 at 128 bytes each,
+  ~4.6KB total) - originally bumped to fix `Could not allocate rx buffer`
+  under the promiscuous-mode approach above; kept since the traffic
+  volume, while reduced, is still real.
+- `mdns_responder.c`'s own separate, dedicated buffer pool
+  (`mdns_msg_pool`, distinct from the pool above) for every packet it
+  parses on `224.0.0.251:5353`. It defaults to just
+  `DNS_RESOLVER_MIN_BUF(2) + CONFIG_MDNS_RESOLVER_ADDITIONAL_BUF_CTR(0)` =
+  2 buffers of `MDNS_RESOLVER_BUF_SIZE(512)` bytes each. Since the
+  responder has to parse every multicast packet it receives to check
+  relevance (not just ones meant for this device), a query burst - e.g.
+  `avahi-browse -a -r`, which makes every other device on the LAN answer
+  about every service type nearly simultaneously - exhausted that 2-buffer
+  pool almost instantly, confirmed via `net stats`: the DNS drop counter
+  spiked sharply during exactly this kind of burst while DNS recv only
+  rose modestly (packets arriving and being dropped specifically at this
+  layer, not just the generic IP layer). Fixed with
+  `CONFIG_MDNS_RESOLVER_ADDITIONAL_BUF_CTR=14`.

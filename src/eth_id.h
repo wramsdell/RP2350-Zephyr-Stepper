@@ -9,11 +9,4 @@
  */
 void set_unique_mac_address(void);
 
-/* Puts the LAN9250 into promiscuous mode so it actually receives multicast
- * frames (mDNS, IGMP queries, etc.) - see the comment on this function's
- * definition for why this driver requires that. Call once, early in
- * main(), alongside set_unique_mac_address().
- */
-void enable_multicast_rx(void);
-
 #endif /* ETH_ID_H */

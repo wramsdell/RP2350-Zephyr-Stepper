@@ -98,7 +98,6 @@ int main(void)
 	LOG_INF("Run dhcpv4 client");
 
 	set_unique_mac_address();
-	enable_multicast_rx();
 	set_unique_hostname();
 
 	if (core1_launch()) {

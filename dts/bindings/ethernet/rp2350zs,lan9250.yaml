@@ -1,0 +1,38 @@
+# Copyright (c) 2024, Mario Paja
+# SPDX-License-Identifier: Apache-2.0
+#
+# Forked from Zephyr's upstream microchip,lan9250.yaml so this project can
+# carry its own patched driver copy (drivers/eth_lan9250/) - see the
+# "Forked LAN9250 driver" section in THEORY_OF_OPERATION.md for why.
+
+description: |
+    LAN9250 standalone 10/100BASE-T Ethernet controller with SPI interface
+    (project-local fork of Zephyr's upstream driver - see drivers/eth_lan9250/)
+
+compatible: "rp2350zs,lan9250"
+
+include: [spi-device.yaml, ethernet-controller.yaml]
+
+properties:
+  int-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      The interrupt pin of LAN9250 is active low.
+      If connected directly the MCU pin should be configured
+      as active low.
+
+  reset-gpios:
+    type: phandle-array
+    description: |
+      The LAN9250's RST# pin is active low. If provided, the driver
+      (eth_lan9250.c's lan9250_init()) drives a timed hardware reset pulse
+      before configuring the chip, per LAN9250 datasheet Section 19.6.3
+      (t_rstia >= 200us, t_cfg >= 15ms after deassertion). Added to this
+      project-local binding because a warm reset of the RP2350 (e.g. after
+      reflashing over USB, as opposed to a full power cycle) does not
+      reset the LAN9250 itself - without a real hardware reset pulse here,
+      the chip can retain state from its previous boot and Zephyr's own
+      init sequence can fail against it (e.g. net_if_set_link_addr()
+      failing in eth_id.c's set_unique_mac_address() until the board is
+      power-cycled).

@@ -5,7 +5,6 @@
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/ethernet.h>
-#include <zephyr/net/ethernet_mgmt.h>
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(eth_id, LOG_LEVEL_INF);
@@ -103,68 +102,4 @@ void set_unique_mac_address(void)
 
 	LOG_INF("MAC address set from hwinfo: %02x:%02x:%02x:%02x:%02x:%02x", mac.addr[0],
 		mac.addr[1], mac.addr[2], mac.addr[3], mac.addr[4], mac.addr[5]);
-}
-
-void enable_multicast_rx(void)
-{
-	struct net_if *iface = net_if_get_default();
-
-	if (!iface) {
-		LOG_WRN("No default interface; multicast RX not enabled");
-		return;
-	}
-
-	/*
-	 * drivers/ethernet/eth_lan9250.c's lan9250_configure() programs
-	 * HMAC_CR with only PADSTR|TXEN|RXEN|FDPX - neither MCPAS (pass all
-	 * multicast) nor a populated+enabled hash filter (HPFILT). Per the
-	 * LAN9250 datasheet's HMAC_CR description, with both of those clear
-	 * the chip's own RX address filter silently drops every frame whose
-	 * destination MAC isn't an exact match for our unicast address or
-	 * the broadcast address - including all multicast traffic (mDNS,
-	 * IGMP queries, everything on 01:00:5e:xx:xx:xx). This is a hardware
-	 * filter, entirely independent of net_if's IGMP/multicast-group
-	 * bookkeeping (net_ipv4_igmp_join(), rejoin_ipv4_mcast_groups(),
-	 * etc.) - joining a group at the IP layer changes nothing here, so
-	 * no amount of IGMP-side fixing can make multicast RX work on its
-	 * own.
-	 *
-	 * A one-line patch to the vendored driver (adding MCPAS to that
-	 * write) was tried and works, but was reverted in favor of this
-	 * app-level approach: patching drivers/ethernet/eth_lan9250.c lives
-	 * outside this repo, in the west-managed ~/zephyrproject/zephyr
-	 * checkout, so it isn't tracked by git here and would silently
-	 * vanish on a `west update`. Full promiscuous mode
-	 * (ETHERNET_CONFIG_TYPE_PROMISC_MODE) is the only RX-filter toggle
-	 * this driver actually implements - there's no
-	 * ETHERNET_CONFIG_TYPE_FILTER handler, and the driver doesn't
-	 * advertise ETHERNET_HW_FILTERING, so the generic per-group hardware
-	 * filter hook (ethernet.c's ethernet_mcast_monitor_cb()) never even
-	 * calls into this driver - so this is the only lever available
-	 * without touching the driver. The IP/UDP layers above still
-	 * correctly filter out traffic nothing is listening for, so this
-	 * doesn't affect what reaches application sockets, just what the
-	 * hardware hands up to be filtered.
-	 *
-	 * This does mean every frame on the LAN gets pulled over the
-	 * LAN9250's SPI bus and examined, not just ones addressed to us -
-	 * on a busy LAN this exhausted the default net_pkt RX buffer pool
-	 * badly enough to break basic reachability (ARP failures,
-	 * "Could not allocate rx buffer" in the log). Fixed by sizing
-	 * CONFIG_NET_PKT_RX_COUNT/CONFIG_NET_BUF_RX_COUNT generously in
-	 * prj.conf rather than trying to reduce traffic volume - see the
-	 * comment there.
-	 *
-	 * net_eth_promisc_mode() -> NET_REQUEST_ETHERNET_SET_PROMISC_MODE
-	 * has no admin-up precondition (unlike NET_REQUEST_ETHERNET_SET_MAC_
-	 * ADDRESS - see the comment in set_unique_mac_address(), above), so
-	 * this is safe to call here without any net_if_down()/up() cycle.
-	 */
-	int ret = net_eth_promisc_mode(iface, true);
-
-	if (ret) {
-		LOG_WRN("Failed to enable promiscuous mode for multicast RX (%d)", ret);
-	} else {
-		LOG_INF("Promiscuous mode enabled (required for multicast RX on this driver)");
-	}
 }

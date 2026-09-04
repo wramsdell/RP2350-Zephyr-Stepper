@@ -106,10 +106,12 @@ driver by default, whose ``pico_rand`` module places an
 before ``usbd_context_area``, corrupting the CDC-ACM USB device context on
 boot and preventing it from enumerating.
 
-Getting mDNS/DNS-SD actually discoverable over the LAN9250 required four
-independent fixes (unique MAC applied without an admin down/up cycle, a
-forced IGMP rejoin once the link is confirmed up, promiscuous mode to work
-around the driver's missing multicast RX filter, and a generously-sized RX
-buffer pool since promiscuous mode means every frame on the LAN gets
-examined) - see "Network discovery" in `THEORY_OF_OPERATION.md
-<THEORY_OF_OPERATION.md>`_ for the full explanation of each.
+Getting mDNS/DNS-SD actually discoverable over the LAN9250 required several
+independent fixes: a unique MAC applied without an admin down/up cycle, a
+forced IGMP rejoin once the link is confirmed up, and multicast RX support
+patched into a project-owned fork of the LAN9250 driver
+(``drivers/eth_lan9250/`` - see "Forked LAN9250 driver" in
+`THEORY_OF_OPERATION.md <THEORY_OF_OPERATION.md>`_), plus generously-sized
+network buffer pools for this LAN's real multicast traffic volume. See
+"Network discovery" in THEORY_OF_OPERATION.md for the full explanation of
+each.
