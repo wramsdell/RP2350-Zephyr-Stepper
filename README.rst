@@ -114,8 +114,12 @@ project is bringing up in phases - a genuinely serious implementation (a
 tunable clock, hardware RX/TX packet timestamping, GPIO event output), not
 just a counter. So far: the clock itself (``ptp clock``), a
 hardware-generated 1PPS output on GPIO1, LAN9250 pin 46 (``ptp pps``) -
-validated on real hardware with an oscilloscope - and a full Zephyr
-``ptp_clock`` driver integration (``ptp_clock`` shell commands above). See
+validated on real hardware with an oscilloscope - a full Zephyr
+``ptp_clock`` driver integration (``ptp_clock`` shell commands above), and
+hardware RX packet timestamping - verified against a real ``ptp4l``
+grandmaster with a mirrored switch port capture confirming the traffic on
+the wire, 23/23 Sync frames correctly timestamped in one run. TX packet
+timestamping is implemented but not yet independently validated. See
 "IEEE 1588 / PTP" in
 `THEORY_OF_OPERATION.md <THEORY_OF_OPERATION.md>`_ for the full phased
 plan and hardware details.

@@ -456,7 +456,15 @@ the same macro family, including the ephemeral-port variant
 (`DNS_SD_REGISTER_SERVICE`) for services that don't have a fixed,
 well-known port the way telnet does.
 
-### Forcing a real IGMP join (`src/mdns_service.c`, `mdns_force_multicast_rejoin()`)
+### Forcing a real IGMP join (`src/eth_id.c`, `force_multicast_rejoin()`)
+
+Originally added as `mdns_service.c`'s `mdns_force_multicast_rejoin()`;
+generalized into `eth_id.c` (already the home for other "network interface
+setup" concerns like MAC address assignment) once phase 4's PTP work
+(below) needed the identical join-timing/refcount-draining logic for its
+own multicast groups (`224.0.1.129`, `224.0.0.107`) via
+`ptp_multicast_rejoin()`. `mdns_force_multicast_rejoin()` is now a thin
+wrapper calling `force_multicast_rejoin(iface, "224.0.0.251")`.
 
 `mdns_responder`'s own boot-time IGMP join for `224.0.0.251` runs at
 `SYS_INIT` priority 96 - long before the LAN9250's PHY finishes link
@@ -479,12 +487,19 @@ boot-time join, then again from its `NET_EVENT_IF_UP` handler) - leaving a
 refcount of 2. A single `net_ipv4_igmp_leave()` call only decrements that;
 `net_if_ipv4_maddr_rm()` treats "count still > 0" as "still in use" and
 returns without ever clearing the joined flag or sending a Leave. So
-`mdns_force_multicast_rejoin()` drains the refcount to zero in a loop
+`force_multicast_rejoin()` drains the refcount to zero in a loop
 (`net_ipv4_igmp_leave()` until the address is actually gone) before
 rejoining - only then does the final `net_ipv4_igmp_join()` perform a real
-send. It's called from `main.c`'s existing `NET_EVENT_IPV4_ADDR_ADD`
+send. `mdns_force_multicast_rejoin()` and `ptp_multicast_rejoin()` are both
+called back-to-back from `main.c`'s existing `NET_EVENT_IPV4_ADDR_ADD`
 handler: a bound DHCP lease is independent proof the link genuinely works
-(it required real Ethernet round trips), unlike at boot.
+(it required real Ethernet round trips), unlike at boot. PTP's groups have
+no boot-time join of their own to race in the first place (nothing
+subscribes to them until phase 4 needs to), so for PTP this is really just
+"join at the right time", not a "rejoin" - but it needs the identical
+timing and the same refcount-safe path, so reusing the helper as-is (rather
+than writing a separate plain-join function) avoids two subtly different
+copies of logic that's already been debugged once.
 
 ### Forked LAN9250 driver (`drivers/eth_lan9250/`)
 
@@ -674,10 +689,12 @@ on:
    `.rate_adjust`), exposed via the Ethernet driver's `.get_ptp_clock()`,
    so the clock becomes usable by ordinary Zephyr networking APIs
    independent of any PTP protocol work. Done, see below.
-4. **Hardware RX/TX packet timestamping** (not yet done) - enable the PTP
-   Timestamp block's ingress/egress recording for Sync/Delay_Req/PDelay
-   messages, wire captured timestamps into `net_pkt`'s timestamp fields
-   (the mechanism Zephyr's gPTP subsystem expects).
+4. **Hardware RX/TX packet timestamping** - enable the PTP Timestamp
+   block's ingress/egress recording for Sync/Delay_Req/PDelay messages,
+   wire captured timestamps into `net_pkt`'s timestamp fields (the
+   mechanism Zephyr's gPTP subsystem expects). RX side done and confirmed
+   against real `ptp4l` traffic, see below; TX side (`lan9250_1588_tx_timestamp_check()`)
+   implemented but not yet independently validated.
 5. **Full network PTP sync** (not yet done, stretch goal) - either
    Zephyr's built-in gPTP (802.1AS) subsystem against the `ptp_clock`
    driver from phase 3, or a minimal hand-rolled ordinary-clock PTP
@@ -794,3 +811,85 @@ testing: `ptp_clock adj <device> <value>`'s help text says `<seconds>`,
 but the value is actually nanoseconds (it calls `ptp_clock_adjust()`
 directly, whose own doc comment says nanoseconds) - not this project's
 bug, just worth knowing when testing.
+
+### Hardware RX packet timestamping (phase 4, `lan9250_1588_rx_timestamp_check()`)
+
+Getting a real hardware ingress timestamp attached to an actual inbound
+PTP frame required three independent bugs to be found and fixed, none of
+which were visible from reading the datasheet alone - each only showed up
+against genuine `ptp4l` traffic on the wire.
+
+**Multicast join capacity.** PTP-over-UDP needs two more IPv4 multicast
+joins (`224.0.1.129` general/event, `224.0.0.107` peer-delay) on top of
+IGMP's own reserved all-systems address and mDNS's `224.0.0.251`.
+`CONFIG_NET_IF_MCAST_IPV4_ADDR_COUNT` defaults to only 2, leaving a single
+free slot already spoken for - both PTP joins failed with `-ENOMEM`
+(`net ipv4` showed only 2 of the 4 expected groups; console log confirmed
+`-12`). Fixed by raising the count to 5 in `prj.conf`, and by extracting
+mDNS's existing forced-rejoin helper into `force_multicast_rejoin()`
+(`eth_id.c`) so PTP's `ptp_multicast_rejoin()` could reuse the identical
+join-timing and refcount-draining logic rather than duplicating it - see
+"Forcing a real IGMP join" above.
+
+**1588 register configuration ordering.** Several `1588_GENERAL_CONFIG`,
+`1588_RX_TIMESTAMP_CONFIG`, and `1588_TX_TIMESTAMP_CONFIG` bit-field
+descriptions explicitly state the host must not change them while
+`1588_CMD_CTL`'s `1588_ENABLE` bit is set - but `lan9250_1588_init()`
+enabled the unit *before* phase 1's `lan9250_1588_timestamping_init()`
+configured them. Fixed by extracting a separate `lan9250_1588_enable()`
+called last, after both init functions complete, and by switching the two
+timestamp-config writes from a blind whole-register overwrite to
+read-modify-write (the original blindly zeroed `RX_PTP_VERSION`/
+`TX_PTP_VERSION` from their reset default of `2h` as a side effect, even
+though those particular bits aren't among the ones the datasheet calls out
+as enable-gated).
+
+**The real remaining bug: capture/drain ordering.** The 1588 unit's
+ingress-timestamp capture (`RX_INGRESS_SEC/NS` + `RX_MSG_HEADER`, up to 4
+events buffered in `CAP_INFO`'s `RX_TS_CNT`) happens at wire speed,
+independent of this driver's frame reads - which are comparatively slow
+and strictly serialized one at a time over a 10MHz SPI bus. Checking
+`CAP_INFO` once, immediately after reading a frame, assumed "the newest
+queued event" and "the frame just read" were the same thing; against real
+traffic that assumption failed constantly - confirmed via a real
+mirrored-switch-port Wireshark capture that genuine PTP frames were
+reaching the driver and parsing correctly, while the hardware capture for
+a given Sync frame would routinely surface one or more *other* frames'
+worth of processing later, correlated against the wrong, by-then-stale
+packet. A bounded busy-wait retry (tested up to 1ms, 10x the first
+attempt) made no measurable difference to the match rate, ruling out a
+fixed short pipeline delay as the cause - the two paths can be out of
+step by more than a second under real traffic.
+
+Closed instead with a symmetric pending-match design in
+`lan9250_runtime`: `rx_pending` (packets read off the wire whose matching
+hardware event hasn't shown up yet - kept alive past normal delivery via
+an extra `net_pkt_ref()`) and `rx_unclaimed` (hardware events that showed
+up before their own frame had even been read out of the FIFO - the
+reverse case, confirmed to happen because physical reception and this
+driver's SPI drain really can complete out of order relative to each
+other). Both lists are bounded to `LAN9250_1588_RX_PENDING_MAX` (4,
+matching the hardware's own capture depth) and self-expire after
+`LAN9250_1588_RX_PENDING_TIMEOUT_MS` (2s) so a genuinely lost counterpart
+can't hold a `net_pkt` reference or a slot forever. Every call now checks,
+in order: does `rx_unclaimed` already have this frame's event; does a
+freshly drained `CAP_INFO` event match this frame directly; does it match
+something in `rx_pending`; only if none of those hit does the current
+frame get added to `rx_pending` for a later call to find.
+
+Verified against a real `ptp4l` grandmaster (`network_transport L2`,
+`time_stamping software`, this project's own `ptp4l` skill) with a
+concurrent Wireshark capture on a mirrored switch port confirming the
+traffic actually on the wire: 23/23 Sync frames correctly timestamped in
+one run (19 matched immediately, 4 via the `rx_unclaimed` path), zero
+drops, zero expirations, zero list evictions.
+
+TX timestamping (`lan9250_1588_tx_timestamp_check()`) was implemented
+alongside the RX side but still uses the older bounded-retry polling
+design (`LAN9250_1588_TX_TS_POLL_ATTEMPTS`/`_DELAY`) predating the
+capture/drain-ordering finding above, and hasn't been independently
+exercised against real traffic yet - see `CONFIG_ETHERNET_LOG_LEVEL_DBG`
+in `prj.conf`. Given the RX side's retry approach measurably failed to
+close the same kind of race even at a 1ms budget, the TX side likely needs
+the same `rx_pending`/`rx_unclaimed`-style redesign once it's actually
+tested against real traffic, not just left as a known gap.
