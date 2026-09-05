@@ -1722,17 +1722,54 @@ static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net
 	int attempt;
 
 	if (!lan9250_ptp_parse_header(frame, len, &pkt_msg_type, &pkt_seq_id)) {
+		/* DIAGNOSTIC (phase 4 TX bring-up, `ptp txtest`): if a frame
+		 * sent by ptp txtest never reaches "parsed PTP frame" below,
+		 * the dump here shows exactly what lan9250_tx() actually
+		 * wrote to the wire, to check against what
+		 * lan9250_ptp_parse_header() expects (ethertype at [12:14],
+		 * frame long enough for the common header). Remove once TX
+		 * timestamping is confirmed working end-to-end.
+		 */
+		LOG_DBG("1588 TX: not recognized as PTP (len=%u, ethertype=0x%04x)",
+			(unsigned)len, len >= 14 ? sys_get_be16(&frame[12]) : 0);
 		return;
 	}
 
+	LOG_DBG("1588 TX: parsed PTP frame (type=%u seq=%u)", pkt_msg_type, pkt_seq_id);
+
 	k_mutex_lock(&context->bank_lock, K_FOREVER);
 
+	/* DIAGNOSTIC (phase 4 TX bring-up, `ptp txtest`): dumps the actual
+	 * live register state controlling whether the hardware will ever
+	 * record an egress timestamp for this frame at all - CMD_CTL's
+	 * 1588_ENABLE, GENERAL_CONFIG's TSU_ENABLE, and TX_TIMESTAMP_CONFIG
+	 * (message-type-enable bits 15:0, TX_PTP_VERSION bits 19:16). Remove
+	 * once TX timestamping is confirmed working end-to-end.
+	 */
+	{
+		uint32_t cmd_ctl = 0, general_config = 0, tx_ts_config = 0, tx_parse_config = 0;
+
+		(void)lan9250_read_sys_reg(dev, LAN9250_1588_CMD_CTL, &cmd_ctl);
+		(void)lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &general_config);
+		if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_TX) == 0) {
+			(void)lan9250_read_sys_reg(dev, LAN9250_1588_TX_TIMESTAMP_CONFIG,
+						   &tx_ts_config);
+			(void)lan9250_read_sys_reg(dev, LAN9250_1588_TX_PARSE_CONFIG,
+						   &tx_parse_config);
+		}
+		LOG_DBG("1588 TX: CMD_CTL=0x%08x GENERAL_CONFIG=0x%08x TX_TIMESTAMP_CONFIG=0x%08x "
+			"TX_PARSE_CONFIG=0x%08x",
+			cmd_ctl, general_config, tx_ts_config, tx_parse_config);
+	}
+
 	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_GENERAL) < 0) {
+		LOG_DBG("1588 TX: bank select (general) failed");
 		goto out;
 	}
 
 	for (attempt = 0; attempt < LAN9250_1588_TX_TS_POLL_ATTEMPTS; attempt++) {
 		if (lan9250_read_sys_reg(dev, LAN9250_1588_CAP_INFO, &cap_info) < 0) {
+			LOG_DBG("1588 TX: CAP_INFO read failed");
 			goto out;
 		}
 
@@ -1744,16 +1781,19 @@ static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net
 	}
 
 	if ((cap_info & LAN9250_1588_CAP_INFO_TX_TS_CNT_MASK) == 0) {
+		LOG_DBG("1588 TX: CAP_INFO=0x%08x, TX_TS_CNT=0 (no HW capture yet)", cap_info);
 		goto out;
 	}
 
 	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_TX) < 0) {
+		LOG_DBG("1588 TX: bank select (TX) failed");
 		goto out;
 	}
 
 	if (lan9250_read_sys_reg(dev, LAN9250_1588_TX_MSG_HEADER, &msg_header) < 0 ||
 	    lan9250_read_sys_reg(dev, LAN9250_1588_TX_EGRESS_SEC, &sec) < 0 ||
 	    lan9250_read_sys_reg(dev, LAN9250_1588_TX_EGRESS_NS, &ns) < 0) {
+		LOG_DBG("1588 TX: MSG_HEADER/EGRESS_SEC/NS read failed");
 		goto out;
 	}
 
