@@ -37,6 +37,7 @@
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/ethernet.h>
+#include <zephyr/sys/byteorder.h>
 #include <ethernet/eth_stats.h>
 
 #include "eth_lan9250_ptp.h"
@@ -598,6 +599,15 @@ static int lan9250_read_buf(const struct device *dev, uint8_t *data_buffer, uint
 	return spi_transceive_dt(&config->spi, &tx, &rx);
 }
 
+/* Defined near lan9250_init() below (Phase 4, IEEE 1588 RX/TX packet
+ * timestamping) - forward-declared here since lan9250_rx()/lan9250_tx()
+ * are defined earlier in this file than the rest of the 1588 code.
+ */
+static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net_pkt *pkt,
+					    size_t pkt_len);
+static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net_pkt *pkt,
+					    const uint8_t *frame, size_t len);
+
 static int lan9250_rx(const struct device *dev)
 {
 	struct lan9250_runtime *ctx = dev->data;
@@ -605,6 +615,7 @@ static int lan9250_rx(const struct device *dev)
 	struct net_pkt *pkt;
 	struct net_buf *pkt_buf;
 	uint16_t pkt_len;
+	uint16_t frame_len;
 	uint8_t pktcnt;
 	uint32_t tmp;
 	int ret;
@@ -633,6 +644,7 @@ static int lan9250_rx(const struct device *dev)
 		return ret;
 	}
 	pkt_len -= 4;
+	frame_len = pkt_len;
 
 	if (pkt_len > NET_ETH_MAX_FRAME_SIZE) {
 		LOG_ERR("Maximum frame length exceeded, it should be: %d", NET_ETH_MAX_FRAME_SIZE);
@@ -673,6 +685,8 @@ static int lan9250_rx(const struct device *dev)
 	if (ret < 0) {
 		return ret;
 	}
+
+	lan9250_1588_rx_timestamp_check(dev, pkt, frame_len);
 
 	/* Feed buffer frame to IP stack */
 	if (net_recv_data(ctx->iface, pkt) < 0) {
@@ -735,6 +749,8 @@ static int lan9250_tx(const struct device *dev, struct net_pkt *pkt)
 			return ret;
 		}
 	}
+
+	lan9250_1588_tx_timestamp_check(dev, pkt, ctx->buf, len);
 
 	k_sem_give(&ctx->tx_rx_sem);
 
@@ -915,26 +931,35 @@ static const struct ethernet_api api_funcs = {
  * readable; no Zephyr ptp_clock integration, GPIO event output, or
  * network timestamping yet.
  */
+/*
+ * Turns the 1588 unit on. Deliberately the LAST 1588-related init step
+ * this driver performs (called from lan9250_init(), after
+ * lan9250_1588_init() and lan9250_1588_timestamping_init() have both
+ * finished configuring it): the datasheet marks GENERAL_CONFIG's
+ * TSU_ENABLE bit and most of RX_TIMESTAMP_CONFIG/TX_TIMESTAMP_CONFIG's
+ * fields (domain match, alternate-master, checksum/FCS bypass, PTP
+ * version) "must not change while 1588_ENABLE is set" - so enabling
+ * first and configuring after, as an earlier version of this driver did,
+ * left those writes touching a live/enabled unit and their effect
+ * undefined. CMD_CTL's bits are all write-1-to-trigger, self-clearing
+ * (writing 0 to any other bit is a no-op), so this single-bit write is
+ * safe and doesn't disturb anything else in the register.
+ */
+static int lan9250_1588_enable(const struct device *dev)
+{
+	return lan9250_write_sys_reg(dev, LAN9250_1588_CMD_CTL, LAN9250_1588_CMD_CTL_ENABLE);
+}
+
 static int lan9250_1588_init(const struct device *dev)
 {
 	int ret;
 	uint32_t general_config;
 
-	/* Enable the 1588 unit. CMD_CTL's bits are all write-1-to-trigger,
-	 * self-clearing (writing 0 to any other bit is defined as a no-op),
-	 * so a single-bit write here is safe and doesn't disturb anything
-	 * else in the register.
-	 */
-	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CMD_CTL, LAN9250_1588_CMD_CTL_ENABLE);
-	if (ret < 0) {
-		return ret;
-	}
-
-	/* The timestamp unit (RX/TX timestamping, not yet used by this
-	 * phase) defaults to enabled (reset value 1b), but set it
-	 * explicitly rather than relying on that - it depends on the
-	 * board's 1588_enable_strap configuration, which this project
-	 * doesn't control.
+	/* The timestamp unit (RX/TX timestamping) defaults to enabled
+	 * (reset value 1b), but set it explicitly rather than relying on
+	 * that - it depends on the board's 1588_enable_strap configuration,
+	 * which this project doesn't control. Must happen before
+	 * lan9250_1588_enable() - see its comment.
 	 */
 	ret = lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &general_config);
 	if (ret < 0) {
@@ -950,7 +975,9 @@ static int lan9250_1588_init(const struct device *dev)
 
 	/* Load the clock to a known value (0) so early reads are
 	 * meaningful before any real time source (network PTP sync, once
-	 * implemented) has set it.
+	 * implemented) has set it. CLOCK_LOAD carries no "must not change
+	 * while enabled" restriction, so its ordering relative to
+	 * lan9250_1588_enable() doesn't matter - done here for simplicity.
 	 */
 	ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_SEC, 0);
 	if (ret < 0) {
@@ -1208,6 +1235,550 @@ int lan9250_1588_pps_enable(const struct device *dev)
 	return 0;
 }
 
+/*
+ * Phase 4: hardware RX/TX packet timestamping - see
+ * THEORY_OF_OPERATION.md's "IEEE 1588 / PTP" section. Caller must hold
+ * context->bank_lock.
+ */
+static int lan9250_1588_bank_select(const struct device *dev, uint32_t bank)
+{
+	return lan9250_write_sys_reg(dev, LAN9250_1588_BANK_PORT_GPIO_SEL, bank);
+}
+
+/*
+ * Enables hardware timestamping of Sync/Delay_Req/Pdelay_Req/Pdelay_Resp
+ * messages on both RX and TX. RX/TX *parsing* (detecting a frame is PTP
+ * at all - RX_PARSE_CONFIG/TX_PARSE_CONFIG) is left at its reset default,
+ * which already enables IPv4/IPv6/Layer2 detection with the standard PTP
+ * multicast MAC/IP addresses - only *which message types get their
+ * ingress/egress time recorded* (RX_TIMESTAMP_CONFIG/TX_TIMESTAMP_CONFIG)
+ * needs an explicit write, since that defaults to all-disabled.
+ *
+ * Must run before lan9250_1588_enable() - see its comment. Read-modify-
+ * write rather than a blind overwrite of the whole register: bits 19:16
+ * (PTP version, reset default 2 = "v2 only") and others above the
+ * message-enable field carry their own "must not change while
+ * 1588_ENABLE is set" restriction, so a blind write that happened to run
+ * after enable (as an earlier version of this driver did) wasn't just
+ * risking those fields specifically - preserving them here is simply
+ * correct regardless.
+ */
+static int lan9250_1588_timestamping_init(const struct device *dev)
+{
+	struct lan9250_runtime *context = dev->data;
+	uint32_t rx_ts_config, tx_ts_config;
+	int ret;
+
+	k_mutex_lock(&context->bank_lock, K_FOREVER);
+
+	ret = lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_RX);
+	if (ret < 0) {
+		goto out;
+	}
+
+	ret = lan9250_read_sys_reg(dev, LAN9250_1588_RX_TIMESTAMP_CONFIG, &rx_ts_config);
+	if (ret < 0) {
+		goto out;
+	}
+
+	rx_ts_config = (rx_ts_config & ~LAN9250_1588_RX_TIMESTAMP_CONFIG_MESSAGE_EN_MASK) |
+		       LAN9250_1588_PTP_MESSAGE_EN_DEFAULT;
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_RX_TIMESTAMP_CONFIG, rx_ts_config);
+	if (ret < 0) {
+		goto out;
+	}
+
+	ret = lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_TX);
+	if (ret < 0) {
+		goto out;
+	}
+
+	ret = lan9250_read_sys_reg(dev, LAN9250_1588_TX_TIMESTAMP_CONFIG, &tx_ts_config);
+	if (ret < 0) {
+		goto out;
+	}
+
+	tx_ts_config = (tx_ts_config & ~LAN9250_1588_TX_TIMESTAMP_CONFIG_MESSAGE_EN_MASK) |
+		       LAN9250_1588_PTP_MESSAGE_EN_DEFAULT;
+
+	ret = lan9250_write_sys_reg(dev, LAN9250_1588_TX_TIMESTAMP_CONFIG, tx_ts_config);
+
+out:
+	k_mutex_unlock(&context->bank_lock);
+
+	return ret;
+}
+
+/*
+ * Parses just enough of a raw Ethernet frame to identify it as a PTP
+ * message and extract messageType + sequenceId, for correlating against
+ * the LAN9250's own captured RX_MSG_HEADER/TX_MSG_HEADER (see the
+ * comment on lan9250_1588_rx_timestamp_check() below for why this
+ * correlation is necessary at all).
+ *
+ * Recognizes: raw Ethernet-II PTP (EtherType 0x88F7) and UDP/IPv4 PTP
+ * (destination port 319 "event" or 320 "general", the standard PTP
+ * ports). Deliberately does NOT handle VLAN-tagged frames, IPv6, or SNAP
+ * encapsulation - a real-world limitation worth revisiting if testing
+ * turns up PTP traffic in one of those forms, but out of scope for this
+ * phase's bring-up. IPv4 header length is read from the IHL field rather
+ * than assumed to be the common no-options 20 bytes, since getting this
+ * wrong would silently misalign every field read after it.
+ *
+ * frame/len: the raw frame bytes (this driver already has these
+ * available as a flat buffer on both RX, via a stack copy below, and TX,
+ * via lan9250_runtime::buf - no net_buf fragment walking needed either
+ * way). Returns true and fills *msg_type and *seq_id if recognized as
+ * PTP, false otherwise (including if the frame is simply too short for
+ * the fields this function needs).
+ */
+static bool lan9250_ptp_parse_header(const uint8_t *frame, size_t len, uint8_t *msg_type,
+				     uint16_t *seq_id)
+{
+	size_t ptp_off;
+	uint16_t ethertype;
+
+	if (len < 14) {
+		return false;
+	}
+
+	ethertype = sys_get_be16(&frame[12]);
+
+	if (ethertype == 0x88F7) {
+		ptp_off = 14;
+	} else if (ethertype == 0x0800) {
+		uint8_t ihl;
+		size_t udp_off;
+
+		if (len < 15) {
+			return false;
+		}
+
+		ihl = (frame[14] & 0x0F) * 4;
+		if (ihl < 20 || len < 14 + ihl + 8) {
+			return false;
+		}
+
+		if (frame[14 + 9] != 0x11 /* IPPROTO_UDP */) {
+			return false;
+		}
+
+		udp_off = 14 + ihl;
+		if (sys_get_be16(&frame[udp_off + 2]) != 319 &&
+		    sys_get_be16(&frame[udp_off + 2]) != 320) {
+			return false;
+		}
+
+		ptp_off = udp_off + 8;
+	} else {
+		return false;
+	}
+
+	/* Common PTP header (IEEE 1588-2008 Table 18/19): need through
+	 * byte 31 (sequenceId) at minimum.
+	 */
+	if (len < ptp_off + 32) {
+		return false;
+	}
+
+	*msg_type = frame[ptp_off] & 0x0F;
+	*seq_id = sys_get_be16(&frame[ptp_off + 30]);
+
+	return true;
+}
+
+#define LAN9250_1588_RX_PENDING_TIMEOUT_MS 2000
+
+static bool lan9250_1588_msg_type_is_timestamped(uint8_t msg_type)
+{
+	return (BIT(msg_type) & LAN9250_1588_PTP_MESSAGE_EN_DEFAULT) != 0;
+}
+
+/* Drops any rx_pending/rx_unclaimed entries whose deadline has passed - a
+ * counterpart that never showed up (genuinely lost, or missed its window
+ * in the 4-deep hardware buffer under very bursty PTP traffic). Called
+ * with bank_lock held.
+ */
+static void lan9250_1588_rx_pending_expire(struct lan9250_runtime *context, int64_t now)
+{
+	for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+		struct lan9250_1588_rx_pending *p = &context->rx_pending[i];
+
+		if (p->pkt != NULL && now >= p->deadline) {
+			LOG_DBG("1588 RX: pending entry expired unmatched (type=%u seq=%u)",
+				p->msg_type, p->seq_id);
+			net_pkt_unref(p->pkt);
+			p->pkt = NULL;
+		}
+	}
+
+	for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+		struct lan9250_1588_rx_unclaimed *u = &context->rx_unclaimed[i];
+
+		if (u->valid && now >= u->deadline) {
+			LOG_DBG("1588 RX: unclaimed event expired unmatched (type=%u seq=%u)",
+				u->msg_type, u->seq_id);
+			u->valid = false;
+		}
+	}
+}
+
+/*
+ * Checks whether the LAN9250 just captured a new RX PTP timestamp and, if
+ * it matches a frame this driver has already read off the wire, attaches
+ * it (net_pkt_set_timestamp()).
+ *
+ * The hardware's ingress-timestamp capture (RX_INGRESS_SEC/NS +
+ * RX_MSG_HEADER, up to LAN9250_1588_RX_PENDING_MAX events buffered in
+ * CAP_INFO's RX_TS_CNT) does not become visible in CAP_INFO at the same
+ * time the frame's data lands in the RX FIFO. Confirmed against real PTP
+ * traffic (phase 4 bring-up): a bounded busy-wait retry (even up to 1ms,
+ * 10x the first attempt) made no measurable difference to the match rate
+ * - so this isn't a fixed short hardware pipeline delay polling can close.
+ * It can lag by more than a second, i.e. by several *other* PTP frames'
+ * worth of processing - "the newest queued RX timestamp" and "the PTP
+ * message this function just received" are frequently different events.
+ *
+ * So instead of polling: every eligible (see
+ * lan9250_1588_msg_type_is_timestamped()) frame's net_pkt is ref'd and
+ * stashed in context->rx_pending before this function returns, unless a
+ * matching hardware event was already available and got attached
+ * directly. Every call - including for message types the hardware never
+ * timestamps (Follow_Up, Announce, ...) - also drains one CAP_INFO event
+ * if one is ready, and checks it against both the current frame and every
+ * still-pending one, so a delayed event gets matched (and its packet's
+ * timestamp attached, however late) no matter which later frame's
+ * processing happens to be running when the hardware finally makes it
+ * visible.
+ *
+ * The reverse can also happen: physical reception (wire-speed) and this
+ * driver's SPI drain (comparatively slow, serialized one frame at a time)
+ * run independently and can complete out of order, so a frame's hardware
+ * capture has sometimes already shown up in CAP_INFO - during an *earlier*
+ * frame's check - before this driver has even read that frame's own data
+ * out of the FIFO yet. context->rx_unclaimed is the mirror of rx_pending
+ * for exactly this: a captured event with nothing (yet) to attach it to.
+ * Every call checks rx_unclaimed for the current frame first, before ever
+ * touching CAP_INFO.
+ *
+ * Entries nobody ever claims - on either side - expire after
+ * LAN9250_1588_RX_PENDING_TIMEOUT_MS so a lost/dropped counterpart can't
+ * hold a net_pkt ref (rx_pending) or a slot (rx_unclaimed) forever.
+ *
+ * This still verifies messageType and sequenceId before attaching a
+ * timestamp, rather than assuming a queue-order correspondence - cheap
+ * insurance against a subtle mismatch that would otherwise be silent and
+ * hard to debug. It does not check the 12-bit sourcePortIdentity CRC
+ * RX_MSG_HEADER also provides (would need replicating the hardware's
+ * CRC-12 algorithm in software) - a known gap if this ever needs to be
+ * airtight against genuinely adversarial or very bursty multi-sender PTP
+ * traffic.
+ *
+ * Any queued RX timestamp event found here is always acknowledged
+ * (RX_TS_INT written to clear, which advances the hardware to the next
+ * buffered event) whether or not it matched anything, so a mismatched/
+ * stale event can never block future ones from being read.
+ */
+static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net_pkt *pkt,
+					    size_t pkt_len)
+{
+	struct lan9250_runtime *context = dev->data;
+	uint8_t header_buf[64];
+	size_t header_len = MIN(pkt_len, sizeof(header_buf));
+	uint8_t pkt_msg_type;
+	uint16_t pkt_seq_id;
+	uint32_t cap_info, msg_header, sec, ns;
+	uint8_t hw_msg_type;
+	uint16_t hw_seq_id;
+
+	net_pkt_cursor_init(pkt);
+
+	if (net_pkt_read(pkt, header_buf, header_len) < 0) {
+		LOG_DBG("1588 RX: net_pkt_read failed");
+		return;
+	}
+
+	net_pkt_cursor_init(pkt);
+
+	if (!lan9250_ptp_parse_header(header_buf, header_len, &pkt_msg_type, &pkt_seq_id)) {
+		return;
+	}
+
+	k_mutex_lock(&context->bank_lock, K_FOREVER);
+
+	lan9250_1588_rx_pending_expire(context, k_uptime_get());
+
+	bool attached = false;
+
+	/* Check for an already-captured hardware event for *this* frame
+	 * before even touching CAP_INFO - physical reception (wire-speed)
+	 * and this driver's SPI drain (slow, serialized per frame) can
+	 * complete out of order, so the capture may have arrived, and been
+	 * stashed here by an earlier call, before this frame's own net_pkt
+	 * even existed. See lan9250_1588_rx_unclaimed.
+	 */
+	for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+		struct lan9250_1588_rx_unclaimed *u = &context->rx_unclaimed[i];
+
+		if (u->valid && u->msg_type == pkt_msg_type && u->seq_id == pkt_seq_id) {
+			struct net_ptp_time ts = {.second = u->sec, .nanosecond = u->ns};
+
+			net_pkt_set_timestamp(pkt, &ts);
+			LOG_DBG("1588 RX timestamp: %u.%09u (type=%u seq=%u) - "
+				"matched an event captured before this frame was read",
+				u->sec, u->ns, u->msg_type, u->seq_id);
+			u->valid = false;
+			attached = true;
+			break;
+		}
+	}
+
+	if (attached) {
+		goto queue;
+	}
+
+	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_GENERAL) < 0) {
+		LOG_DBG("1588 RX: bank select (general) failed");
+		goto queue;
+	}
+
+	if (lan9250_read_sys_reg(dev, LAN9250_1588_CAP_INFO, &cap_info) < 0) {
+		LOG_DBG("1588 RX: CAP_INFO read failed");
+		goto queue;
+	}
+
+	if ((cap_info & LAN9250_1588_CAP_INFO_RX_TS_CNT_MASK) == 0) {
+		goto queue;
+	}
+
+	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_RX) < 0) {
+		goto queue;
+	}
+
+	if (lan9250_read_sys_reg(dev, LAN9250_1588_RX_MSG_HEADER, &msg_header) < 0 ||
+	    lan9250_read_sys_reg(dev, LAN9250_1588_RX_INGRESS_SEC, &sec) < 0 ||
+	    lan9250_read_sys_reg(dev, LAN9250_1588_RX_INGRESS_NS, &ns) < 0) {
+		goto queue;
+	}
+
+	hw_msg_type = (msg_header & LAN9250_1588_MSG_HEADER_MSG_TYPE_MASK) >>
+		      LAN9250_1588_MSG_HEADER_MSG_TYPE_SHIFT;
+	hw_seq_id = msg_header & LAN9250_1588_MSG_HEADER_SEQ_ID_MASK;
+
+	/* Always acknowledge/drain now that MSG_HEADER/INGRESS_SEC/NS have
+	 * been read - INT_STS is "na" bank, no bank switch needed. Done
+	 * before the matching below so a mismatched/stale event can never
+	 * block the next one from being read.
+	 */
+	(void)lan9250_write_sys_reg(dev, LAN9250_1588_INT_STS, LAN9250_1588_INT_STS_RX_TS_INT);
+
+	if (hw_msg_type == pkt_msg_type && hw_seq_id == pkt_seq_id) {
+		struct net_ptp_time ts = {.second = sec, .nanosecond = ns};
+
+		net_pkt_set_timestamp(pkt, &ts);
+		LOG_DBG("1588 RX timestamp: %u.%09u (type=%u seq=%u)", sec, ns, hw_msg_type,
+			hw_seq_id);
+		attached = true;
+	} else {
+		bool matched_pending = false;
+
+		for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+			struct lan9250_1588_rx_pending *p = &context->rx_pending[i];
+
+			if (p->pkt != NULL && p->msg_type == hw_msg_type &&
+			    p->seq_id == hw_seq_id) {
+				struct net_ptp_time ts = {.second = sec, .nanosecond = ns};
+
+				net_pkt_set_timestamp(p->pkt, &ts);
+				LOG_DBG("1588 RX timestamp: %u.%09u (type=%u seq=%u) - "
+					"matched a pending earlier frame, not this one",
+					sec, ns, hw_msg_type, hw_seq_id);
+				net_pkt_unref(p->pkt);
+				p->pkt = NULL;
+				matched_pending = true;
+				break;
+			}
+		}
+
+		if (!matched_pending) {
+			/* Doesn't match anything we know about yet - stash it
+			 * rather than dropping it, in case it's for a frame
+			 * that hasn't been read out of the RX FIFO yet (see
+			 * lan9250_1588_rx_unclaimed and the check at the top
+			 * of this function).
+			 */
+			struct lan9250_1588_rx_unclaimed *slot = NULL;
+
+			for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+				if (!context->rx_unclaimed[i].valid) {
+					slot = &context->rx_unclaimed[i];
+					break;
+				}
+			}
+
+			if (slot == NULL) {
+				slot = &context->rx_unclaimed[0];
+				for (size_t i = 1; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+					if (context->rx_unclaimed[i].deadline < slot->deadline) {
+						slot = &context->rx_unclaimed[i];
+					}
+				}
+				LOG_DBG("1588 RX: unclaimed list full, evicting oldest "
+					"(type=%u seq=%u)", slot->msg_type, slot->seq_id);
+			}
+
+			slot->valid = true;
+			slot->msg_type = hw_msg_type;
+			slot->seq_id = hw_seq_id;
+			slot->sec = sec;
+			slot->ns = ns;
+			slot->deadline = k_uptime_get() + LAN9250_1588_RX_PENDING_TIMEOUT_MS;
+
+			LOG_DBG("1588 RX timestamp event didn't match this or any pending "
+				"packet (hw type=%u seq=%u, pkt type=%u seq=%u) - stashed as "
+				"unclaimed",
+				hw_msg_type, hw_seq_id, pkt_msg_type, pkt_seq_id);
+		}
+	}
+
+queue:
+	if (!attached && lan9250_1588_msg_type_is_timestamped(pkt_msg_type)) {
+		struct lan9250_1588_rx_pending *slot = NULL;
+
+		for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+			if (context->rx_pending[i].pkt == NULL) {
+				slot = &context->rx_pending[i];
+				break;
+			}
+		}
+
+		if (slot == NULL) {
+			/* All slots full - evict the oldest (soonest deadline)
+			 * to make room rather than silently giving up on this
+			 * frame's chance at a timestamp. Shouldn't happen in
+			 * practice: LAN9250_1588_RX_PENDING_MAX slots and a
+			 * LAN9250_1588_RX_PENDING_TIMEOUT_MS timeout give far
+			 * more headroom than this message type's real traffic
+			 * rate needs.
+			 */
+			slot = &context->rx_pending[0];
+			for (size_t i = 1; i < LAN9250_1588_RX_PENDING_MAX; i++) {
+				if (context->rx_pending[i].deadline < slot->deadline) {
+					slot = &context->rx_pending[i];
+				}
+			}
+			LOG_WRN("1588 RX: pending list full, evicting oldest (type=%u seq=%u)",
+				slot->msg_type, slot->seq_id);
+			net_pkt_unref(slot->pkt);
+		}
+
+		net_pkt_ref(pkt);
+		slot->pkt = pkt;
+		slot->msg_type = pkt_msg_type;
+		slot->seq_id = pkt_seq_id;
+		slot->deadline = k_uptime_get() + LAN9250_1588_RX_PENDING_TIMEOUT_MS;
+	}
+
+	k_mutex_unlock(&context->bank_lock);
+}
+
+/*
+ * TX counterpart of lan9250_1588_rx_timestamp_check() above - same
+ * correlation strategy and same caveats, called from lan9250_tx() after
+ * it has queued the frame into the LAN9250's TX FIFO.
+ *
+ * Unlike the RX side, this can't simply check CAP_INFO once: this
+ * driver's TX completion isn't interrupt-driven at all (lan9250_thread()
+ * only services PHY link and RX FIFO level interrupts - see that
+ * function above), and the status-FIFO drain loop at the top of
+ * lan9250_tx() drains whatever backlog was *already* pending from prior
+ * sends, read before the current frame is even written - it doesn't
+ * confirm *this* frame's own completion. Physical transmission (and so
+ * the 1588 egress capture) genuinely may not have happened yet by the
+ * time lan9250_write_buf() returns. So this retries a bounded number of
+ * times with a short delay between attempts rather than checking once -
+ * cheap and bounded (worst case is a full one -1518-byte frame's wire
+ * time, ~1.2ms even at 10Mbps), and avoids redesigning this driver's TX
+ * completion signaling into something interrupt-driven, which is out of
+ * scope for this phase.
+ *
+ * frame/len here is lan9250_tx()'s own already-serialized copy of the
+ * outgoing frame (context->buf), not pkt itself - simpler than re-reading
+ * from pkt a second time, and exactly the bytes that went out the wire.
+ */
+#define LAN9250_1588_TX_TS_POLL_ATTEMPTS 5
+#define LAN9250_1588_TX_TS_POLL_DELAY    K_MSEC(1)
+
+static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net_pkt *pkt,
+					    const uint8_t *frame, size_t len)
+{
+	struct lan9250_runtime *context = dev->data;
+	uint8_t pkt_msg_type;
+	uint16_t pkt_seq_id;
+	uint32_t cap_info, msg_header, sec, ns;
+	uint8_t hw_msg_type;
+	uint16_t hw_seq_id;
+	int attempt;
+
+	if (!lan9250_ptp_parse_header(frame, len, &pkt_msg_type, &pkt_seq_id)) {
+		return;
+	}
+
+	k_mutex_lock(&context->bank_lock, K_FOREVER);
+
+	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_GENERAL) < 0) {
+		goto out;
+	}
+
+	for (attempt = 0; attempt < LAN9250_1588_TX_TS_POLL_ATTEMPTS; attempt++) {
+		if (lan9250_read_sys_reg(dev, LAN9250_1588_CAP_INFO, &cap_info) < 0) {
+			goto out;
+		}
+
+		if ((cap_info & LAN9250_1588_CAP_INFO_TX_TS_CNT_MASK) != 0) {
+			break;
+		}
+
+		k_sleep(LAN9250_1588_TX_TS_POLL_DELAY);
+	}
+
+	if ((cap_info & LAN9250_1588_CAP_INFO_TX_TS_CNT_MASK) == 0) {
+		goto out;
+	}
+
+	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_TX) < 0) {
+		goto out;
+	}
+
+	if (lan9250_read_sys_reg(dev, LAN9250_1588_TX_MSG_HEADER, &msg_header) < 0 ||
+	    lan9250_read_sys_reg(dev, LAN9250_1588_TX_EGRESS_SEC, &sec) < 0 ||
+	    lan9250_read_sys_reg(dev, LAN9250_1588_TX_EGRESS_NS, &ns) < 0) {
+		goto out;
+	}
+
+	hw_msg_type = (msg_header & LAN9250_1588_MSG_HEADER_MSG_TYPE_MASK) >>
+		      LAN9250_1588_MSG_HEADER_MSG_TYPE_SHIFT;
+	hw_seq_id = msg_header & LAN9250_1588_MSG_HEADER_SEQ_ID_MASK;
+
+	if (hw_msg_type == pkt_msg_type && hw_seq_id == pkt_seq_id) {
+		struct net_ptp_time ts = {.second = sec, .nanosecond = ns};
+
+		net_pkt_set_timestamp(pkt, &ts);
+		LOG_DBG("1588 TX timestamp: %u.%09u (type=%u seq=%u)", sec, ns, hw_msg_type,
+			hw_seq_id);
+	} else {
+		LOG_DBG("1588 TX timestamp event didn't match transmitted packet "
+			"(hw type=%u seq=%u, pkt type=%u seq=%u) - dropping stale event",
+			hw_msg_type, hw_seq_id, pkt_msg_type, pkt_seq_id);
+	}
+
+	(void)lan9250_write_sys_reg(dev, LAN9250_1588_INT_STS, LAN9250_1588_INT_STS_TX_TS_INT);
+
+out:
+	k_mutex_unlock(&context->bank_lock);
+}
+
 static int lan9250_init(const struct device *dev)
 {
 	int ret;
@@ -1295,6 +1866,18 @@ static int lan9250_init(const struct device *dev)
 		return ret;
 	}
 
+	ret = lan9250_1588_timestamping_init(dev);
+	if (ret < 0) {
+		LOG_ERR("1588 timestamping init failed");
+		return ret;
+	}
+
+	ret = lan9250_1588_enable(dev);
+	if (ret < 0) {
+		LOG_ERR("1588 enable failed");
+		return ret;
+	}
+
 	LOG_INF("LAN9250 Initialized");
 
 	return 0;
@@ -1304,6 +1887,7 @@ static int lan9250_init(const struct device *dev)
 	static struct lan9250_runtime lan9250_##inst##_runtime = {                                 \
 		.tx_rx_sem = Z_SEM_INITIALIZER(lan9250_##inst##_runtime.tx_rx_sem, 1, UINT_MAX),   \
 		.int_sem = Z_SEM_INITIALIZER(lan9250_##inst##_runtime.int_sem, 0, UINT_MAX),       \
+		.bank_lock = Z_MUTEX_INITIALIZER(lan9250_##inst##_runtime.bank_lock),              \
 	};                                                                                         \
                                                                                                    \
 	static const struct lan9250_config lan9250_##inst##_config = {                             \

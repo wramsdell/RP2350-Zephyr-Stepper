@@ -123,6 +123,67 @@
 #define LAN9250_1588_CLOCK_STEP_ADJ_DIR        0x80000000 /* 0=subtracted, 1=added */
 #define LAN9250_1588_CLOCK_STEP_ADJ_VALUE_MASK 0x3FFFFFFF
 
+/* 1588_INT_STS bits (also 1588_INT_EN, same bit positions) */
+#define LAN9250_1588_INT_STS_TX_TS_INT 0x00001000 /* bit 12 */
+#define LAN9250_1588_INT_STS_RX_TS_INT 0x00000100 /* bit 8 */
+
+/*
+ * 1588 Port/GPIO banked registers (datasheet Section 14.8.18 onward).
+ * Port and GPIO registers share one address window (0x158-0x18C);
+ * 1588_BANK_PORT_GPIO_SEL's BANK_SEL[2:0] selects which bank is currently
+ * mapped there. Must be written before accessing any register below, and
+ * accessing a "Port General"/"Port RX"/"Port TX" register requires having
+ * selected that bank first - the offsets themselves are reused across
+ * banks.
+ */
+#define LAN9250_1588_BANK_PORT_GPIO_SEL 0x0154
+#define LAN9250_1588_BANK_SEL_PORT_GENERAL 0
+#define LAN9250_1588_BANK_SEL_PORT_RX      1
+#define LAN9250_1588_BANK_SEL_PORT_TX      2
+#define LAN9250_1588_BANK_SEL_GPIOS        3
+
+/* Bank 0 ("Port General") */
+#define LAN9250_1588_LATENCY      0x0158
+#define LAN9250_1588_ASYM_PEERDLY 0x015C
+#define LAN9250_1588_CAP_INFO     0x0160
+#define LAN9250_1588_CAP_INFO_TX_TS_CNT_MASK 0x00000070 /* bits 6:4 */
+#define LAN9250_1588_CAP_INFO_TX_TS_CNT_SHIFT 4
+#define LAN9250_1588_CAP_INFO_RX_TS_CNT_MASK 0x00000007 /* bits 2:0 */
+
+/* Bank 1 ("Port RX") */
+#define LAN9250_1588_RX_PARSE_CONFIG      0x0158
+#define LAN9250_1588_RX_TIMESTAMP_CONFIG  0x015C
+#define LAN9250_1588_RX_TIMESTAMP_CONFIG_MESSAGE_EN_MASK 0x0000FFFF
+#define LAN9250_1588_RX_TS_INSERT_CONFIG  0x0160
+#define LAN9250_1588_RX_FILTER_CONFIG     0x0168
+#define LAN9250_1588_RX_INGRESS_SEC       0x016C
+#define LAN9250_1588_RX_INGRESS_NS        0x0170
+#define LAN9250_1588_RX_MSG_HEADER        0x0174
+#define LAN9250_1588_MSG_HEADER_MSG_TYPE_MASK 0x000F0000 /* bits 19:16 */
+#define LAN9250_1588_MSG_HEADER_MSG_TYPE_SHIFT 16
+#define LAN9250_1588_MSG_HEADER_SEQ_ID_MASK    0x0000FFFF /* bits 15:0 */
+
+/* Bank 2 ("Port TX") */
+#define LAN9250_1588_TX_PARSE_CONFIG      0x0158
+#define LAN9250_1588_TX_TIMESTAMP_CONFIG  0x015C
+#define LAN9250_1588_TX_TIMESTAMP_CONFIG_MESSAGE_EN_MASK 0x0000FFFF
+#define LAN9250_1588_TX_EGRESS_SEC        0x016C
+#define LAN9250_1588_TX_EGRESS_NS         0x0170
+#define LAN9250_1588_TX_MSG_HEADER        0x0174
+/* TX_MSG_HEADER shares RX_MSG_HEADER's bit layout (MSG_HEADER_* above). */
+
+/* PTP messageType values needed for RX/TX message-type-enable masks
+ * (IEEE 1588-2008 Table 19) - only the four types this driver enables
+ * timestamping for.
+ */
+#define LAN9250_1588_PTP_MSGTYPE_SYNC        0x0
+#define LAN9250_1588_PTP_MSGTYPE_DELAY_REQ   0x1
+#define LAN9250_1588_PTP_MSGTYPE_PDELAY_REQ  0x2
+#define LAN9250_1588_PTP_MSGTYPE_PDELAY_RESP 0x3
+#define LAN9250_1588_PTP_MESSAGE_EN_DEFAULT \
+	(BIT(LAN9250_1588_PTP_MSGTYPE_SYNC) | BIT(LAN9250_1588_PTP_MSGTYPE_DELAY_REQ) | \
+	 BIT(LAN9250_1588_PTP_MSGTYPE_PDELAY_REQ) | BIT(LAN9250_1588_PTP_MSGTYPE_PDELAY_RESP))
+
 /* 1588_CMD_CTL bits */
 #define LAN9250_1588_CMD_CTL_CLOCK_TARGET_READ 0x00002000
 #define LAN9250_1588_CMD_CTL_CLOCK_TEMP_RATE   0x00000080
@@ -409,6 +470,34 @@ struct lan9250_config {
 	struct net_eth_mac_config mac_cfg;
 };
 
+/* Matches the LAN9250's own RX timestamp capture buffer depth (CAP_INFO's
+ * RX_TS_CNT field) - see the comment on lan9250_1588_rx_timestamp_check().
+ */
+#define LAN9250_1588_RX_PENDING_MAX 4
+
+struct lan9250_1588_rx_pending {
+	struct net_pkt *pkt; /* NULL = free slot */
+	uint8_t msg_type;
+	uint16_t seq_id;
+	int64_t deadline; /* k_uptime_get(), give up/unref past this */
+};
+
+/* The mirror image of lan9250_1588_rx_pending: a hardware timestamp
+ * captured for a frame this driver hasn't read out of the SPI RX FIFO yet.
+ * See the comment on lan9250_1588_rx_timestamp_check() - physical
+ * reception (wire-speed) and this driver's SPI drain (comparatively slow,
+ * serialized per frame) can complete out of order, so a capture can be
+ * ready before its own frame's net_pkt even exists yet.
+ */
+struct lan9250_1588_rx_unclaimed {
+	bool valid;
+	uint8_t msg_type;
+	uint16_t seq_id;
+	uint32_t sec;
+	uint32_t ns;
+	int64_t deadline;
+};
+
 struct lan9250_runtime {
 	struct net_if *iface;
 
@@ -431,6 +520,33 @@ struct lan9250_runtime {
 	 * something to return.
 	 */
 	const struct device *ptp_clock;
+
+	/* Guards 1588_BANK_PORT_GPIO_SEL + whatever banked register access
+	 * follows it (see eth_lan9250_priv.h's "1588 Port/GPIO banked
+	 * registers" comment) as one atomic sequence. Needed because
+	 * lan9250_rx() (this driver's own RX thread) and lan9250_tx()
+	 * (called from whatever thread the network stack's TX path runs
+	 * on) can run concurrently, and both need to select a bank before
+	 * reading their own RX/TX timestamp registers - without this, one
+	 * side's bank selection could be stomped by the other's mid-access.
+	 * Distinct from tx_rx_sem above, which is a narrower RX-drain/
+	 * TX-start handoff, not a general critical-section lock.
+	 */
+	struct k_mutex bank_lock;
+
+	/* Packets awaiting a hardware RX timestamp that hadn't landed in
+	 * CAP_INFO yet by the time this driver finished reading them off the
+	 * wire - see the comment on lan9250_1588_rx_timestamp_check() (the
+	 * "pending" array) for why this exists and how entries are matched/
+	 * expired. Guarded by bank_lock, same as the registers this
+	 * correlates against.
+	 */
+	struct lan9250_1588_rx_pending rx_pending[LAN9250_1588_RX_PENDING_MAX];
+
+	/* Hardware timestamps captured for a frame not yet read out of the
+	 * SPI RX FIFO - see lan9250_1588_rx_unclaimed. Guarded by bank_lock.
+	 */
+	struct lan9250_1588_rx_unclaimed rx_unclaimed[LAN9250_1588_RX_PENDING_MAX];
 };
 
 #endif /*_LAN9250_*/

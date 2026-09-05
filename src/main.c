@@ -51,6 +51,14 @@ static void handler(struct net_mgmt_event_callback *cb,
 	 * before the PHY has linked. See mdns_force_multicast_rejoin(). */
 	mdns_force_multicast_rejoin(iface);
 
+	/* PTP (224.0.1.129 general/event, 224.0.0.107 peer-delay) has no
+	 * boot-time join of its own to race - nothing subscribes to it
+	 * until now - so this is the group's only join, not a "force
+	 * rejoin", but it still needs the same timing (a confirmed-up link)
+	 * and the same refcount-safe join path. See ptp_multicast_rejoin()
+	 * (eth_id.c). */
+	ptp_multicast_rejoin(iface);
+
 	for (i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
 		char buf[NET_IPV4_ADDR_LEN];
 
