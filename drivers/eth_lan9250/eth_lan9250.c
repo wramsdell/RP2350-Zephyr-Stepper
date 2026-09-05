@@ -1706,6 +1706,17 @@ queue:
  * frame/len here is lan9250_tx()'s own already-serialized copy of the
  * outgoing frame (context->buf), not pkt itself - simpler than re-reading
  * from pkt a second time, and exactly the bytes that went out the wire.
+ *
+ * Bring-up note (phase 4 TX, confirmed working against real L2-framed PTP
+ * traffic - see THEORY_OF_OPERATION.md's "Hardware TX packet
+ * timestamping" section): CAP_INFO's TX_TS_CNT never incremented for any
+ * outbound PTP frame whose common header left messageLength (bytes 2-3)
+ * at 0, no matter what else was tried. The datasheet's own "Transmit
+ * Message Egress Time Recording" section (14.2.2.3) doesn't list
+ * messageLength among its documented gating conditions (only messageType
+ * enable, versionPTP, domain, alt-master, FCS/checksum) - so this
+ * requirement is real but apparently undocumented. Any code constructing
+ * a PTP frame for this driver to transmit must set a real messageLength.
  */
 #define LAN9250_1588_TX_TS_POLL_ATTEMPTS 5
 #define LAN9250_1588_TX_TS_POLL_DELAY    K_MSEC(1)
@@ -1722,45 +1733,10 @@ static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net
 	int attempt;
 
 	if (!lan9250_ptp_parse_header(frame, len, &pkt_msg_type, &pkt_seq_id)) {
-		/* DIAGNOSTIC (phase 4 TX bring-up, `ptp txtest`): if a frame
-		 * sent by ptp txtest never reaches "parsed PTP frame" below,
-		 * the dump here shows exactly what lan9250_tx() actually
-		 * wrote to the wire, to check against what
-		 * lan9250_ptp_parse_header() expects (ethertype at [12:14],
-		 * frame long enough for the common header). Remove once TX
-		 * timestamping is confirmed working end-to-end.
-		 */
-		LOG_DBG("1588 TX: not recognized as PTP (len=%u, ethertype=0x%04x)",
-			(unsigned)len, len >= 14 ? sys_get_be16(&frame[12]) : 0);
 		return;
 	}
 
-	LOG_DBG("1588 TX: parsed PTP frame (type=%u seq=%u)", pkt_msg_type, pkt_seq_id);
-
 	k_mutex_lock(&context->bank_lock, K_FOREVER);
-
-	/* DIAGNOSTIC (phase 4 TX bring-up, `ptp txtest`): dumps the actual
-	 * live register state controlling whether the hardware will ever
-	 * record an egress timestamp for this frame at all - CMD_CTL's
-	 * 1588_ENABLE, GENERAL_CONFIG's TSU_ENABLE, and TX_TIMESTAMP_CONFIG
-	 * (message-type-enable bits 15:0, TX_PTP_VERSION bits 19:16). Remove
-	 * once TX timestamping is confirmed working end-to-end.
-	 */
-	{
-		uint32_t cmd_ctl = 0, general_config = 0, tx_ts_config = 0, tx_parse_config = 0;
-
-		(void)lan9250_read_sys_reg(dev, LAN9250_1588_CMD_CTL, &cmd_ctl);
-		(void)lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &general_config);
-		if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_TX) == 0) {
-			(void)lan9250_read_sys_reg(dev, LAN9250_1588_TX_TIMESTAMP_CONFIG,
-						   &tx_ts_config);
-			(void)lan9250_read_sys_reg(dev, LAN9250_1588_TX_PARSE_CONFIG,
-						   &tx_parse_config);
-		}
-		LOG_DBG("1588 TX: CMD_CTL=0x%08x GENERAL_CONFIG=0x%08x TX_TIMESTAMP_CONFIG=0x%08x "
-			"TX_PARSE_CONFIG=0x%08x",
-			cmd_ctl, general_config, tx_ts_config, tx_parse_config);
-	}
 
 	if (lan9250_1588_bank_select(dev, LAN9250_1588_BANK_SEL_PORT_GENERAL) < 0) {
 		LOG_DBG("1588 TX: bank select (general) failed");
@@ -1781,7 +1757,6 @@ static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net
 	}
 
 	if ((cap_info & LAN9250_1588_CAP_INFO_TX_TS_CNT_MASK) == 0) {
-		LOG_DBG("1588 TX: CAP_INFO=0x%08x, TX_TS_CNT=0 (no HW capture yet)", cap_info);
 		goto out;
 	}
 

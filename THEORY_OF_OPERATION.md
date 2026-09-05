@@ -692,9 +692,11 @@ on:
 4. **Hardware RX/TX packet timestamping** - enable the PTP Timestamp
    block's ingress/egress recording for Sync/Delay_Req/PDelay messages,
    wire captured timestamps into `net_pkt`'s timestamp fields (the
-   mechanism Zephyr's gPTP subsystem expects). RX side done and confirmed
-   against real `ptp4l` traffic, see below; TX side (`lan9250_1588_tx_timestamp_check()`)
-   implemented but not yet independently validated.
+   mechanism Zephyr's gPTP subsystem expects). Both sides done and
+   confirmed - RX against real `ptp4l` L2 traffic, TX via the `ptp txtest`
+   shell command - see below. TX is confirmed for L2-framed PTP only;
+   UDP/IPv4-framed PTP TX was tried and did not produce a capture, left as
+   a known, unresolved gap.
 5. **Full network PTP sync** (not yet done, stretch goal) - either
    Zephyr's built-in gPTP (802.1AS) subsystem against the `ptp_clock`
    driver from phase 3, or a minimal hand-rolled ordinary-clock PTP
@@ -884,12 +886,63 @@ traffic actually on the wire: 23/23 Sync frames correctly timestamped in
 one run (19 matched immediately, 4 via the `rx_unclaimed` path), zero
 drops, zero expirations, zero list evictions.
 
-TX timestamping (`lan9250_1588_tx_timestamp_check()`) was implemented
-alongside the RX side but still uses the older bounded-retry polling
-design (`LAN9250_1588_TX_TS_POLL_ATTEMPTS`/`_DELAY`) predating the
-capture/drain-ordering finding above, and hasn't been independently
-exercised against real traffic yet - see `CONFIG_ETHERNET_LOG_LEVEL_DBG`
-in `prj.conf`. Given the RX side's retry approach measurably failed to
-close the same kind of race even at a 1ms budget, the TX side likely needs
-the same `rx_pending`/`rx_unclaimed`-style redesign once it's actually
-tested against real traffic, not just left as a known gap.
+### Hardware TX packet timestamping (phase 4, `lan9250_1588_tx_timestamp_check()`)
+
+TX timestamping still uses the original bounded-retry polling design
+(`LAN9250_1588_TX_TS_POLL_ATTEMPTS`/`_DELAY`, 5 attempts × 1ms) rather
+than RX's `rx_pending`/`rx_unclaimed` redesign - it hasn't needed it in
+practice, since TX traffic here is driven by an explicit shell command
+(`ptp txtest`) rather than a continuous real-world stream, so the
+capture/drain-ordering race RX had to solve for essentially never comes
+up. Confirmed against real transmitted frames (`ptp txtest`, `src/ptp_shell.c`)
+with a concurrent Wireshark capture on a mirrored switch port confirming
+the traffic actually left the wire.
+
+Getting a real hardware TX egress timestamp required finding one thing
+the datasheet doesn't document: **`messageLength` (PTP common header
+bytes 2-3) must be a real, non-zero value.** A test frame with messageType
+and versionPTP both correct but messageLength left at 0 transmits
+perfectly fine and is recognized by this driver's own parser, but the
+LAN9250 silently never records an egress timestamp for it - `CAP_INFO`'s
+`TX_TS_CNT` stays at exactly `0x0`, indefinitely, no matter how long you
+wait or how many frames you send. This isn't in the datasheet's own list
+of TX egress-recording gating conditions (section 14.2.2.3: messageType
+enable, versionPTP match, domain match, alt-master, FCS/checksum) - it's
+a real requirement the datasheet just doesn't mention. Setting
+messageLength to 44 (correct for a real Sync message, even though the
+test frame's payload only actually contains the first 32 bytes) fixed it
+immediately and reproducibly (5/5 sends captured correctly in the
+confirming run).
+
+Ruling this in took an extensive process of elimination first: config
+registers all read back exactly as documented (`CMD_CTL`, `GENERAL_CONFIG`,
+`TX_TIMESTAMP_CONFIG`'s message-type-enable and version-match fields,
+`TX_PARSE_CONFIG`'s L2/address enables) with nothing amiss; the frame was
+confirmed reaching the wire correctly via a mirrored-port capture; no
+on-the-fly one-step timestamp insertion was silently happening instead
+(checked the actual wire bytes where that would land - untouched);
+forcing `TX_PTP_FCS_DIS` and proactively clearing `1588_INT_STS`'s
+`TX_TS_INT` both made no difference; five independent real-world LAN9250
+driver implementations (Zephyr upstream, NuttX, CycloneTCP, Microchip's
+own official reference driver, and mainline Linux's `smsc911x`) were
+checked and none implement TX hardware timestamping at all, so no
+external reference existed to compare against.
+
+One self-inflicted wrinkle along the way: an earlier diagnostic added to
+test a "stale/stuck buffer" theory proactively wrote `1588_INT_STS`'s
+`TX_TS_INT` bit to clear it before checking `CAP_INFO` - but per the
+datasheet, writing that bit is exactly the action that decrements
+`CAP_INFO`'s `TX_TS_CNT`. That diagnostic was silently consuming the one
+real capture event before the actual check ever saw it, on every single
+test run after it was added, until the ordering bug was caught (the
+tell: `INT_STS` read back with `TX_TS_INT` genuinely `SET` for the first
+time, immediately followed by `CAP_INFO` reading `0` anyway).
+
+UDP/IPv4-framed PTP TX (dst port 319, 224.0.1.129) was also tried, with
+the same `messageLength` fix applied - and did not produce a capture.
+Wireshark confirmed the synthetic UDP/IPv4 frame was well-formed at every
+layer that matters (valid IPv4 header/checksum, valid UDP header, correctly
+dissected as `eth:ethertype:ip:udp:ptp`) and this driver's own parser
+recognized it correctly, so this is a genuine, separate, unresolved gap -
+left as a known limitation. TX timestamping is confirmed working for
+L2-framed PTP only; `ptp txtest` sends L2 frames exclusively.

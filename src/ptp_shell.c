@@ -95,22 +95,34 @@ static int cmd_ptp_pps(const struct shell *sh, size_t argc, char **argv)
  * for its raw Ethernet frames (subsys/net/l2/ethernet/lldp/lldp.c) - so it
  * actually reaches lan9250_tx() and exercises
  * lan9250_1588_tx_timestamp_check() the same way a genuine outbound PTP
- * message would, no shortcuts into driver internals.
- *
- * Only messageType (byte 0) and sequenceId (bytes 30-31) matter to
- * lan9250_ptp_parse_header()/the 1588 timestamp match, so the rest of the
- * 32-byte PTP common header is left zeroed. messageType 0 (Sync) is one of
- * the four types LAN9250_1588_PTP_MESSAGE_EN_DEFAULT enables for hardware
- * timestamping (eth_lan9250_priv.h) - matches what RX-side validation used
- * against real ptp4l traffic, for consistency.
+ * message would, no shortcuts into driver internals. Confirmed working:
+ * see THEORY_OF_OPERATION.md's "Hardware TX packet timestamping" section.
  *
  * Destined to the well-known Layer-2 (non-peer-delay) PTP multicast
  * address so a real capture on a mirrored switch port - the same setup
  * used for RX validation, see THEORY_OF_OPERATION.md's "Hardware RX
- * packet timestamping" section - can also confirm this frame actually
- * left the wire. Watch the console (CONFIG_ETHERNET_LOG_LEVEL_DBG=y,
- * already set in prj.conf) for lan9250_1588_tx_timestamp_check()'s own
- * LOG_DBG output to see whether the hardware egress capture gets matched.
+ * packet timestamping" section - can confirm this frame actually left the
+ * wire. Watch the console (CONFIG_ETHERNET_LOG_LEVEL_DBG=y, already set
+ * in prj.conf) for lan9250_1588_tx_timestamp_check()'s own LOG_DBG output
+ * to see the hardware egress capture get matched.
+ *
+ * Only messageType (byte 0), messageLength (bytes 2-3), and sequenceId
+ * (bytes 30-31) of the 32-byte PTP common header matter here - the rest
+ * is left zeroed. messageType 0 (Sync) is one of the four types
+ * LAN9250_1588_PTP_MESSAGE_EN_DEFAULT enables for hardware timestamping
+ * (eth_lan9250_priv.h) - matches what RX-side validation used against
+ * real ptp4l traffic, for consistency. messageLength must be a real,
+ * non-zero value (44, matching a genuine Sync message's length, even
+ * though this frame's payload only actually contains the first 32 bytes)
+ * - the LAN9250 silently never records an egress timestamp for a frame
+ * whose messageLength is 0, a requirement not listed among the
+ * datasheet's documented TX egress-recording gating conditions (section
+ * 14.2.2.3: messageType enable, versionPTP, domain, alt-master,
+ * FCS/checksum) but real nonetheless.
+ *
+ * UDP/IPv4-framed PTP (dst port 319, 224.0.1.129) was also tried and did
+ * NOT produce a capture even with messageLength fixed - left as a known,
+ * unresolved gap; this command validates the L2 path only.
  */
 static int cmd_ptp_txtest(const struct shell *sh, size_t argc, char **argv)
 {
@@ -136,24 +148,17 @@ static int cmd_ptp_txtest(const struct shell *sh, size_t argc, char **argv)
 		return -ENODEV;
 	}
 
+	ptp_payload[0] = 0x00; /* messageType = Sync (transportSpecific nibble = 0) */
+	ptp_payload[1] = 0x02; /* versionPTP = 2, matching TX_TIMESTAMP_CONFIG's default */
+	sys_put_be16(44, &ptp_payload[2]); /* messageLength - see comment above */
+	sys_put_be16(seq_id, &ptp_payload[30]);
+
 	pkt = net_pkt_alloc_with_buffer(iface, sizeof(ptp_payload), NET_AF_UNSPEC, 0,
 					K_MSEC(100));
 	if (!pkt) {
 		shell_error(sh, "Failed to allocate net_pkt");
 		return -ENOMEM;
 	}
-
-	ptp_payload[0] = 0x00; /* messageType = Sync (transportSpecific nibble = 0) */
-	/* versionPTP = 2 (low nibble of byte 1) - 1588_TX_TIMESTAMP_CONFIG's
-	 * TX_PTP_VERSION field defaults to 2h and, unless set to 0 ("any
-	 * version"), the hardware only records an egress timestamp for a
-	 * frame whose own versionPTP matches it. A version-0 test frame
-	 * transmits fine but is silently never captured - confirmed via
-	 * CAP_INFO staying TX_TS_CNT=0 even after 10 rapid real (verified on
-	 * the wire via a mirrored-port capture) sends.
-	 */
-	ptp_payload[1] = 0x02;
-	sys_put_be16(seq_id, &ptp_payload[30]);
 
 	if (net_pkt_write(pkt, ptp_payload, sizeof(ptp_payload)) < 0) {
 		net_pkt_unref(pkt);

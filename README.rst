@@ -103,6 +103,7 @@ Shell commands
 
    ptp clock               read the LAN9250's 1588 hardware clock (twice, ~200ms apart)
    ptp pps                  arm a 1PPS output on GPIO1 (LAN9250 pin 46)
+   ptp txtest               send a real L2 PTP Sync frame to test hardware TX timestamping
 
    ptp_clock get/set/adj/freq/selftest PTP_CLOCK   generic Zephyr ptp_clock shell (get/set/step/rate-trim)
 
@@ -118,9 +119,10 @@ validated on real hardware with an oscilloscope - a full Zephyr
 ``ptp_clock`` driver integration (``ptp_clock`` shell commands above), and
 hardware RX packet timestamping - verified against a real ``ptp4l``
 grandmaster with a mirrored switch port capture confirming the traffic on
-the wire, 23/23 Sync frames correctly timestamped in one run. TX packet
-timestamping is implemented but not yet independently validated. See
-"IEEE 1588 / PTP" in
+the wire, 23/23 Sync frames correctly timestamped in one run - and hardware
+TX packet timestamping (``ptp txtest``), confirmed for Layer-2-framed PTP
+(UDP/IPv4 framing does not yet produce a capture - a known, unresolved
+gap). See "IEEE 1588 / PTP" in
 `THEORY_OF_OPERATION.md <THEORY_OF_OPERATION.md>`_ for the full phased
 plan and hardware details.
 
