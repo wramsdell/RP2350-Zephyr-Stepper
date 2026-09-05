@@ -697,12 +697,38 @@ on:
    shell command - see below. TX is confirmed for L2-framed PTP only;
    UDP/IPv4-framed PTP TX was tried and did not produce a capture, left as
    a known, unresolved gap.
-5. **Full network PTP sync** (not yet done, stretch goal) - either
-   Zephyr's built-in gPTP (802.1AS) subsystem against the `ptp_clock`
-   driver from phase 3, or a minimal hand-rolled ordinary-clock PTP
-   client (Sync/Delay_Req exchange + servo) if gPTP doesn't fit. Milestone:
-   the 1PPS output from phase 2 tracking/locking to an external reference
-   instead of free-running.
+5. **Full network PTP sync** (not yet done, stretch goal) - Zephyr's
+   built-in gPTP (802.1AS) subsystem (`CONFIG_NET_GPTP`, marked
+   `EXPERIMENTAL` upstream) looks like a genuinely good fit, checked
+   directly against its source
+   (`subsys/net/l2/ethernet/gptp/`) rather than assumed:
+   - It's L2-only (`ETH_NET_L3_REGISTER(gPTP, NET_ETH_PTYPE_PTP,
+     net_gptp_recv)`, `gptp.c`) - exactly the transport phase 4 confirmed
+     working for both RX and TX, so none of the known UDP/IPv4 TX gap
+     applies here.
+   - It reads/writes packet timestamps via `net_pkt_timestamp()`/the
+     `net_pkt` timestamp field directly (`gptp_md.c`) - precisely what
+     `lan9250_1588_rx_timestamp_check()`/`lan9250_1588_tx_timestamp_check()`
+     already populate via `net_pkt_set_timestamp()`. No new driver-side
+     RX/TX hook should be needed.
+   - It gets the clock device via `net_eth_get_ptp_clock()` (`gptp.c`,
+     `gptp_mi.c`) - the exact same `.get_ptp_clock` callback phase 3
+     already wires up (`lan9250_get_ptp_clock()`).
+   - It always sets a real `message_length` when constructing its own
+     messages (`gptp_messages.c`) - so phase 4's discovered "messageLength
+     must be non-zero or the LAN9250 silently drops the TX capture"
+     requirement (see "Hardware TX packet timestamping" below) should be
+     satisfied automatically by gPTP's own real traffic, not just by
+     `ptp txtest`'s hand-built test frames.
+
+   None of this is validated against real gPTP traffic yet - it's a
+   source-level read, not a confirmed result - but it means phase 5 starts
+   from "wire it up and test" rather than "figure out if this is even
+   feasible". A minimal hand-rolled ordinary-clock PTP client (Sync/
+   Delay_Req exchange + servo) remains the fallback if gPTP's
+   experimental status or resource footprint proves impractical on this
+   board. Milestone either way: the 1PPS output from phase 2 tracking/
+   locking to an external reference instead of free-running.
 
 ### Register access
 
