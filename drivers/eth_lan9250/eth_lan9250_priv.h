@@ -470,10 +470,33 @@ struct lan9250_config {
 	struct net_eth_mac_config mac_cfg;
 };
 
-/* Matches the LAN9250's own RX timestamp capture buffer depth (CAP_INFO's
- * RX_TS_CNT field) - see the comment on lan9250_1588_rx_timestamp_check().
+/* Originally sized to match the LAN9250's own RX timestamp capture buffer
+ * depth (CAP_INFO's RX_TS_CNT field, up to 4) - see the comment on
+ * lan9250_1588_rx_timestamp_check(). That's the hardware's own physical
+ * buffer depth, not a ceiling on how many *software-side* entries can be
+ * outstanding at once: rx_pending/rx_unclaimed track frames and events
+ * still waiting to be matched across an asynchronous, sometimes
+ * multi-second gap, and every PTP frame - not just HW-timestamp-eligible
+ * ones - drains one CAP_INFO event per check (see that comment for why).
+ * Real gPTP traffic interleaves far more message types (Sync, Follow_Up,
+ * Pdelay_Req/Resp, Pdelay_Resp_Follow_Up, Announce) at a much higher
+ * combined rate than this project's earlier, single-message-type RX
+ * validation against real ptp4l traffic - confirmed via a live two-board
+ * gPTP bring-up that plenty of Pdelay_Resp_Follow_Up frames (never
+ * HW-timestamped themselves) were draining CAP_INFO events belonging to
+ * other, real Pdelay_Req/Resp frames, only for genuine rx_pending/
+ * rx_unclaimed entries to then expire unmatched under the resulting
+ * pressure on just 4 slots each - starving gPTP's Peer Delay measurement
+ * of RX timestamps often enough to prevent its neighborRateRatio from
+ * ever going valid, which in turn (see gptp_update_local_port_clock() in
+ * Zephyr's own gptp_mi.c) silently skips every ongoing clock correction:
+ * the observed symptom was two boards converging roughly on connection
+ * and then drifting apart with no visible ongoing correction. Widened
+ * well past the hardware's own 4-deep buffer to give real, busy gPTP
+ * traffic enough headroom; RAM cost is negligible (a pointer + a few
+ * small fields per slot).
  */
-#define LAN9250_1588_RX_PENDING_MAX 4
+#define LAN9250_1588_RX_PENDING_MAX 16
 
 struct lan9250_1588_rx_pending {
 	struct net_pkt *pkt; /* NULL = free slot */

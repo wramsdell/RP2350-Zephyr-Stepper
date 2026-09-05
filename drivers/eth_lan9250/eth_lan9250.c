@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <math.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/net_if.h>
@@ -283,6 +284,60 @@ static int lan9250_write_phy_reg(const struct device *dev, uint8_t address, uint
 	/* Wait PHY to be ready and send reading register command */
 	return lan9250_wait_mac_ready(dev, LAN9250_HMAC_MII_ACC, LAN9250_HMAC_MII_ACC_MIIBZY, 0,
 				      LAN9250_PHY_TIMEOUT);
+}
+
+/*
+ * Overrides the devicetree-configured (fixed, identical-on-every-board)
+ * MAC address in ctx->mac_address with one derived from the RP2350's own
+ * per-chip unique ID, if hwinfo is available - same derivation
+ * src/eth_id.c's set_unique_mac_address() used to do from main(), moved
+ * here to run early enough for phase 5's gPTP support.
+ *
+ * This must happen before lan9250_set_macaddr() (immediately below, in
+ * lan9250_init()) programs the hardware's own RX address filter, and
+ * before this driver's net_if is registered at all - not just before
+ * main() runs. Zephyr's gPTP subsystem computes its own clockIdentity
+ * (an EUI-64 derived from the interface's link address) exactly once, in
+ * net_gptp_init(), called from net_post_init() via
+ * SYS_INIT(net_init, POST_KERNEL, CONFIG_NET_INIT_PRIO) - which runs
+ * during kernel boot, before main() is ever called. A MAC override from
+ * main() (the original approach) is applied correctly for everything
+ * else (ARP, DHCP, hostname) but is already too late for gPTP: every
+ * board ends up computing the identical clockIdentity from the
+ * devicetree overlay's placeholder MAC (00:00:00:01:02:03 here), since
+ * that's still what the interface's link address was at the moment
+ * net_gptp_init() ran. Confirmed via a live two-board test: every
+ * captured Pdelay_Resp's ClockIdentity read back as the fixed
+ * 0x000000fffe010203 regardless of which board sent it, and the
+ * Best Master Clock Algorithm never progressed past ROLE_SELECTION
+ * because - from either board's perspective - every peer response
+ * appeared to carry its own local Clock Identity.
+ */
+static void lan9250_load_unique_mac_address(struct lan9250_runtime *ctx)
+{
+	uint8_t hw_id[8];
+	ssize_t len;
+
+	len = hwinfo_get_device_id(hw_id, sizeof(hw_id));
+	if (len < (ssize_t)sizeof(ctx->mac_address)) {
+		LOG_WRN("hwinfo_get_device_id() returned %d bytes; keeping the devicetree MAC",
+			(int)len);
+		return;
+	}
+
+	/* Use the last 6 of the (up to 8) ID bytes - RP2350's flash unique
+	 * ID, or DEVICE_ID+WAFER_ID depending on variant, either way stable
+	 * and unique per chip (see hwinfo_rpi_pico.c).
+	 */
+	memcpy(ctx->mac_address, &hw_id[len - (ssize_t)sizeof(ctx->mac_address)],
+	       sizeof(ctx->mac_address));
+
+	/* Locally administered, unicast - the same convention Zephyr's own
+	 * net_eth_mac_load()/NET_ETH_MAC_RANDOM path uses for a generated
+	 * (non-IEEE-assigned) MAC address.
+	 */
+	ctx->mac_address[0] &= ~0x01;
+	ctx->mac_address[0] |= 0x02;
 }
 
 static int lan9250_set_macaddr(const struct device *dev)
@@ -792,7 +847,15 @@ static void lan9250_thread(void *p1, void *p2, void *p3)
 			/* Read PHY interrupt source register */
 			lan9250_read_phy_reg(dev, LAN9250_PHY_INTERRUPT_SOURCE, &tmp);
 			if (tmp & LAN9250_PHY_INTERRUPT_SOURCE_LINK_UP) {
-				LOG_DBG("LINK UP");
+				uint16_t special_stat = 0, special_ind = 0;
+
+				lan9250_read_phy_reg(dev, LAN9250_PHY_SPECIAL_CONTROL_STATUS,
+						     &special_stat);
+				lan9250_read_phy_reg(dev, LAN9250_PHY_SPECIAL_CONTROL_STAT_IND,
+						     &special_ind);
+				LOG_INF("DIAG LINK UP: special_control_status=0x%04x "
+					"special_control_stat_ind=0x%04x",
+					special_stat, special_ind);
 				net_eth_carrier_on(context->iface);
 			} else if (tmp & LAN9250_PHY_INTERRUPT_SOURCE_LINK_DOWN) {
 				LOG_DBG("LINK DOWN");
@@ -814,7 +877,15 @@ static enum ethernet_hw_caps lan9250_get_capabilities(const struct device *dev)
 {
 	ARG_UNUSED(dev);
 
-	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE
+	/* ETHERNET_PTP is a hard gate, not just informational: Zephyr's own
+	 * net_eth_get_ptp_clock() (subsys/net/l2/ethernet/ethernet.c) returns
+	 * NULL - regardless of whether .get_ptp_clock is implemented - unless
+	 * this bit is set here. gPTP (phase 5) calls exactly that function to
+	 * reach lan9250_get_ptp_clock(), so this must be advertised for gPTP
+	 * to work at all, even though phase 3 already wired up
+	 * .get_ptp_clock itself.
+	 */
+	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE | ETHERNET_PTP
 #if defined(CONFIG_NET_PROMISCUOUS_MODE)
 		| ETHERNET_PROMISC_MODE
 #endif
@@ -1117,7 +1188,16 @@ int lan9250_ptp_clock_rate_adjust(const struct device *dev, double ratio)
 		rate_adj |= LAN9250_1588_CLOCK_RATE_ADJ_DIR;
 	}
 
-	return lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, rate_adj);
+	int ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, rate_adj);
+
+	uint32_t readback = 0xdeadbeef;
+	int rret = lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, &readback);
+
+	LOG_INF("DIAG rate_adjust: ratio=%.9f ppb=%.3f wrote=0x%08x write_ret=%d "
+		"readback=0x%08x read_ret=%d",
+		ratio, ppb, rate_adj, ret, readback, rret);
+
+	return ret;
 }
 
 /*
@@ -1231,6 +1311,31 @@ int lan9250_1588_pps_enable(const struct device *dev)
 	}
 
 	LOG_INF("1588 PPS output armed on GPIO1 (first pulse at clock second %u)", sec + 2);
+
+	/* DIAGNOSTIC (temporary): read every register this function just
+	 * wrote straight back, to compare a boot-time auto-arm (which the
+	 * scope shows produces no pulses) against a shell-triggered manual
+	 * arm (which always works) - same code path, so any difference here
+	 * would mean something is racing with or reverting this sequence,
+	 * not a logic bug in the sequence itself.
+	 */
+	{
+		uint32_t rb_led_cfg = 0, rb_gpio_cfg = 0, rb_general_config = 0;
+		uint32_t rb_reload_sec = 0, rb_reload_ns = 0, rb_target_sec = 0, rb_target_ns = 0;
+
+		lan9250_read_sys_reg(dev, LAN9250_LED_CFG, &rb_led_cfg);
+		lan9250_read_sys_reg(dev, LAN9250_GPIO_CFG, &rb_gpio_cfg);
+		lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &rb_general_config);
+		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_RELOAD_SEC(0), &rb_reload_sec);
+		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_RELOAD_NS(0), &rb_reload_ns);
+		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_SEC(0), &rb_target_sec);
+		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_NS(0), &rb_target_ns);
+
+		LOG_INF("DIAG pps readback: led_cfg=0x%08x gpio_cfg=0x%08x general_config=0x%08x "
+			"reload_sec=%u reload_ns=%u target_sec=%u target_ns=%u",
+			rb_led_cfg, rb_gpio_cfg, rb_general_config,
+			rb_reload_sec, rb_reload_ns, rb_target_sec, rb_target_ns);
+	}
 
 	return 0;
 }
@@ -1678,6 +1783,15 @@ queue:
 		slot->msg_type = pkt_msg_type;
 		slot->seq_id = pkt_seq_id;
 		slot->deadline = k_uptime_get() + LAN9250_1588_RX_PENDING_TIMEOUT_MS;
+
+		/* DIAGNOSTIC (phase 5 gPTP bring-up): shows exactly what
+		 * every rx_pending entry is waiting for, to cross-reference
+		 * against later "stashed as unclaimed"/"expired unmatched"
+		 * lines and see whether the expected hw event ever actually
+		 * shows up with a mismatched type/seq, or never shows up at
+		 * all. Remove once the Pdelay reliability issue is resolved.
+		 */
+		LOG_DBG("1588 RX: added to pending (type=%u seq=%u)", pkt_msg_type, pkt_seq_id);
 	}
 
 	k_mutex_unlock(&context->bank_lock);
@@ -1780,6 +1894,24 @@ static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net
 		struct net_ptp_time ts = {.second = sec, .nanosecond = ns};
 
 		net_pkt_set_timestamp(pkt, &ts);
+		/* net_pkt_set_timestamp() alone only updates pkt's own
+		 * metadata - it does not notify anyone waiting on this
+		 * specific pkt via net_if_register_timestamp_cb(). gPTP's
+		 * Pdelay_Resp handling (gptp_handle_pdelay_req(),
+		 * subsys/net/l2/ethernet/gptp/gptp_messages.c) registers
+		 * exactly such a callback on its own reply packet, to know
+		 * when its real TX egress time is available so it can send
+		 * the matching Pdelay_Resp_Follow_Up message - without this
+		 * call, that callback never fires and Pdelay_Resp_Follow_Up
+		 * is never sent (found via a live two-board gPTP bring-up:
+		 * Pdelay_Req/Resp exchanged fine, but every reply-side board
+		 * logged "Multiple pdelay requests" the moment a second
+		 * request arrived while the first's still-registered,
+		 * never-fired callback sat stale).
+		 */
+#if defined(CONFIG_NET_PKT_TIMESTAMP_THREAD)
+		net_if_add_tx_timestamp(pkt);
+#endif
 		LOG_DBG("1588 TX timestamp: %u.%09u (type=%u seq=%u)", sec, ns, hw_msg_type,
 			hw_seq_id);
 	} else {
@@ -1869,6 +2001,7 @@ static int lan9250_init(const struct device *dev)
 	}
 
 	(void)net_eth_mac_load(&config->mac_cfg, context->mac_address);
+	lan9250_load_unique_mac_address(context);
 	ret = lan9250_set_macaddr(dev);
 	if (ret < 0) {
 		LOG_ERR("Set mac address failed");

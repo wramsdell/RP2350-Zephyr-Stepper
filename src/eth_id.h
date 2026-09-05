@@ -3,14 +3,6 @@
 
 #include <zephyr/net/net_if.h>
 
-/* Overrides the LAN9250's MAC address (hardcoded/static in the devicetree
- * overlay) with one derived from the RP2350's real per-chip unique ID via
- * hwinfo, so each physical board gets its own stable, distinct MAC - and by
- * extension, via set_unique_hostname() (mdns_service.h), its own mDNS
- * hostname. Call once, early in main(), before DHCP starts.
- */
-void set_unique_mac_address(void);
-
 /* Forces a real IGMP leave+rejoin of the IPv4 multicast group at addr_str
  * (dotted-decimal) on iface. Call once a working link is independently
  * confirmed (e.g. a bound DHCP lease) - see the comment on this function's

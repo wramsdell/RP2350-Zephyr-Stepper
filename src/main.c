@@ -17,6 +17,7 @@ LOG_MODULE_REGISTER(net_dhcpv4_client_sample, LOG_LEVEL_DBG);
 #include "stepper_shell.h"
 #include "mdns_service.h"
 #include "eth_id.h"
+#include "ptp_shell.h"
 
 #define DHCP_OPTION_NTP (42)
 
@@ -105,7 +106,14 @@ int main(void)
 {
 	LOG_INF("Run dhcpv4 client");
 
-	set_unique_mac_address();
+	/* The unique MAC address itself is now set much earlier, inside
+	 * eth_lan9250.c's lan9250_init() - see
+	 * lan9250_load_unique_mac_address()'s comment for why that had to
+	 * move out of main() (gPTP's clockIdentity, computed during kernel
+	 * boot before main() runs, needs it that early). This just reads
+	 * the now-already-unique link address back out to derive the
+	 * hostname suffix.
+	 */
 	set_unique_hostname();
 
 	if (core1_launch()) {
@@ -127,6 +135,33 @@ int main(void)
 	net_dhcpv4_add_option_callback(&dhcp_cb);
 
 	net_if_foreach(start_dhcpv4_client, NULL);
+
+	/* Arm the 1PPS scope-observation output at boot instead of requiring
+	 * the `ptp pps` shell command after every reboot/reflash - see
+	 * lan9250_1588_pps_enable()'s own comment for the hardware details.
+	 * Two separate waits, for two separate reasons:
+	 *
+	 * 1. A fixed hardware settle delay: arming this immediately at the
+	 *    top of main() (~30ms after kernel boot) reliably fails silently
+	 *    - the LAN9250's own internal reset/auto-load sequence apparently
+	 *    hasn't fully settled that early, even though device_is_ready()
+	 *    and the SPI writes themselves both report success.
+	 *
+	 * 2. ptp_pps_arm_when_synced() then additionally waits for gPTP to
+	 *    consider this port's clock trustworthy before actually arming -
+	 *    otherwise the Clock Target gets seeded from whatever the local
+	 *    clock happens to read mid-negotiation, silently baking in
+	 *    however far off that was as a fixed offset between this board's
+	 *    pulses and its peer's (see gptp_get_port_sync_state()'s doc
+	 *    comment). Falls back to arming anyway past its own timeout, for
+	 *    a standalone board with no peer to sync to.
+	 */
+	k_sleep(K_SECONDS(15));
+	{
+		const struct device *const lan9250_dev = DEVICE_DT_GET(DT_NODELABEL(lan9250));
+
+		ptp_pps_arm_when_synced(lan9250_dev, 60000);
+	}
 
 	while(1)
 	{
