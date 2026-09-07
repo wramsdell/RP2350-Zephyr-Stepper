@@ -5,9 +5,10 @@
 #include <zephyr/kernel.h>
 
 /*
- * Arms the LAN9250's 1PPS scope-observation output, but only once gPTP
- * considers this port's clock trustworthy (elected master, or slave with
- * as_capable true) - see gptp_get_port_sync_state()'s doc comment for why
+ * Arms the LAN9250's 1PPS scope-observation output, but only once PTP
+ * considers this port's clock trustworthy (time-transmitter, or a
+ * receiver that's completed initial calibration) - see
+ * ptp_get_port_sync_state()'s doc comment (zephyr/net/ptp.h) for why
  * that's the right proxy for "safe to treat this clock as synchronized".
  * Blocks the calling thread while polling, up to max_wait_ms; if that
  * elapses without convergence, arms anyway and logs a warning, rather than

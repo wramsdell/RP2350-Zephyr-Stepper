@@ -67,3 +67,43 @@ void ptp_multicast_rejoin(struct net_if *iface)
 	/* Peer-delay mechanism messages (Pdelay_Req/Resp). */
 	force_multicast_rejoin(iface, "224.0.0.107");
 }
+
+#define MULTICAST_MEMBERSHIP_REFRESH_INTERVAL K_SECONDS(30)
+
+static struct net_if *multicast_refresh_iface;
+static struct k_work_delayable multicast_refresh_work;
+
+static void multicast_membership_refresh_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	/* Real IGMP membership reports, sent periodically rather than only
+	 * once at boot - this network's switch was confirmed (via a live
+	 * capture) to send zero IGMP query traffic at all, meaning nothing
+	 * ever prompts a renewed report on its own. Without one, an IGMP-
+	 * snooping switch with no active querier has no way to distinguish
+	 * "still a member" from "left silently", and relies purely on an
+	 * internal aging timeout with nothing to refresh it - matching the
+	 * intermittent, worsening-over-time multicast reception observed
+	 * between boards once three of them were competing for the switch's
+	 * forwarding table. net_ipv4_igmp_join() can't be reused for this -
+	 * it's a deliberate no-op once already joined - so this uses the new
+	 * net_ipv4_igmp_resend_reports() instead (see its comment in the
+	 * Zephyr tree, subsys/net/ip/igmp.c).
+	 */
+	(void)net_ipv4_igmp_resend_reports(multicast_refresh_iface);
+
+	k_work_reschedule(&multicast_refresh_work, MULTICAST_MEMBERSHIP_REFRESH_INTERVAL);
+}
+
+void multicast_membership_refresh_start(struct net_if *iface)
+{
+	if (multicast_refresh_iface != NULL) {
+		/* Already running - only one interface's worth needed. */
+		return;
+	}
+
+	multicast_refresh_iface = iface;
+	k_work_init_delayable(&multicast_refresh_work, multicast_membership_refresh_handler);
+	k_work_reschedule(&multicast_refresh_work, MULTICAST_MEMBERSHIP_REFRESH_INTERVAL);
+}

@@ -662,6 +662,7 @@ static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net
 					    size_t pkt_len);
 static void lan9250_1588_tx_timestamp_check(const struct device *dev, struct net_pkt *pkt,
 					    const uint8_t *frame, size_t len);
+static void lan9250_1588_rx_pending_expire(struct lan9250_runtime *context, int64_t now);
 
 static int lan9250_rx(const struct device *dev)
 {
@@ -712,6 +713,57 @@ static int lan9250_rx(const struct device *dev)
 	if (!pkt) {
 		LOG_ERR("%s: Could not allocate rx buffer", dev->name);
 		eth_stats_update_errors_rx(ctx->iface);
+
+		/* Sweep rx_pending/rx_unclaimed for timed-out entries even on
+		 * this failure path - lan9250_1588_rx_pending_expire() is
+		 * otherwise only reached from lan9250_1588_rx_timestamp_check(),
+		 * which itself only runs *after* a successful allocation above.
+		 * If the RX pkt pool is genuinely exhausted (e.g. by
+		 * LAN9250_1588_RX_PENDING_MAX held refs awaiting a hardware
+		 * timestamp match that never arrives), that's a real deadlock:
+		 * no allocation can succeed until stale entries are freed, but
+		 * the only code path that frees them requires an allocation to
+		 * have already succeeded. Running the sweep here breaks that
+		 * cycle regardless of whether this particular frame's own
+		 * allocation happened to succeed.
+		 */
+		k_mutex_lock(&ctx->bank_lock, K_FOREVER);
+		lan9250_1588_rx_pending_expire(ctx, k_uptime_get());
+		k_mutex_unlock(&ctx->bank_lock);
+
+		/* Must still drain this frame's pkt_len bytes (plus the same
+		 * trailing dummy word the success path reads below) out of
+		 * LAN9250_RX_DATA_FIFO even though it's being dropped - the
+		 * chip's own RX FIFO read pointer only advances as bytes are
+		 * clocked out over SPI, so returning here without reading
+		 * them leaves this frame's payload sitting in the FIFO. The
+		 * next call would then misinterpret those leftover bytes as
+		 * a new packet's RX_FIFO_INF/RX_STATUS_FIFO header, corrupting
+		 * every subsequent frame (Sync, Follow_Up, Announce, ...)
+		 * until the chip is reset - silently starving PTP of any
+		 * further valid traffic while its local clock free-runs
+		 * uncorrected. lan9250_read_buf() already treats a NULL
+		 * buffer as "discard", matching how the cmd/instr echo bytes
+		 * above are handled.
+		 *
+		 * Chunked at buf_rx_size, same as the success path below -
+		 * every other call site in this driver only ever asks the SPI
+		 * layer for a transfer that size or smaller (bounded by
+		 * CONFIG_NET_BUF_DATA_SIZE), so a single one-shot transfer of
+		 * up to a full ~1514-byte frame here would be the first time
+		 * this driver ever asked the RP2350's SPI/DMA path for a
+		 * transfer that large - not proven safe, and not worth risking
+		 * on a rarely-exercised error path.
+		 */
+		while (pkt_len > 0) {
+			uint16_t chunk = pkt_len > buf_rx_size ? buf_rx_size : pkt_len;
+
+			if (lan9250_read_buf(dev, NULL, chunk) < 0) {
+				break;
+			}
+			pkt_len -= chunk;
+		}
+		(void)lan9250_read_sys_reg(dev, LAN9250_RX_DATA_FIFO, &tmp);
 		return 0;
 	}
 
@@ -853,7 +905,7 @@ static void lan9250_thread(void *p1, void *p2, void *p3)
 						     &special_stat);
 				lan9250_read_phy_reg(dev, LAN9250_PHY_SPECIAL_CONTROL_STAT_IND,
 						     &special_ind);
-				LOG_INF("DIAG LINK UP: special_control_status=0x%04x "
+				LOG_DBG("LINK UP: special_control_status=0x%04x "
 					"special_control_stat_ind=0x%04x",
 					special_stat, special_ind);
 				net_eth_carrier_on(context->iface);
@@ -1188,16 +1240,7 @@ int lan9250_ptp_clock_rate_adjust(const struct device *dev, double ratio)
 		rate_adj |= LAN9250_1588_CLOCK_RATE_ADJ_DIR;
 	}
 
-	int ret = lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, rate_adj);
-
-	uint32_t readback = 0xdeadbeef;
-	int rret = lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, &readback);
-
-	LOG_INF("DIAG rate_adjust: ratio=%.9f ppb=%.3f wrote=0x%08x write_ret=%d "
-		"readback=0x%08x read_ret=%d",
-		ratio, ppb, rate_adj, ret, readback, rret);
-
-	return ret;
+	return lan9250_write_sys_reg(dev, LAN9250_1588_CLOCK_RATE_ADJ, rate_adj);
 }
 
 /*
@@ -1311,31 +1354,6 @@ int lan9250_1588_pps_enable(const struct device *dev)
 	}
 
 	LOG_INF("1588 PPS output armed on GPIO1 (first pulse at clock second %u)", sec + 2);
-
-	/* DIAGNOSTIC (temporary): read every register this function just
-	 * wrote straight back, to compare a boot-time auto-arm (which the
-	 * scope shows produces no pulses) against a shell-triggered manual
-	 * arm (which always works) - same code path, so any difference here
-	 * would mean something is racing with or reverting this sequence,
-	 * not a logic bug in the sequence itself.
-	 */
-	{
-		uint32_t rb_led_cfg = 0, rb_gpio_cfg = 0, rb_general_config = 0;
-		uint32_t rb_reload_sec = 0, rb_reload_ns = 0, rb_target_sec = 0, rb_target_ns = 0;
-
-		lan9250_read_sys_reg(dev, LAN9250_LED_CFG, &rb_led_cfg);
-		lan9250_read_sys_reg(dev, LAN9250_GPIO_CFG, &rb_gpio_cfg);
-		lan9250_read_sys_reg(dev, LAN9250_1588_GENERAL_CONFIG, &rb_general_config);
-		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_RELOAD_SEC(0), &rb_reload_sec);
-		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_RELOAD_NS(0), &rb_reload_ns);
-		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_SEC(0), &rb_target_sec);
-		lan9250_read_sys_reg(dev, LAN9250_1588_CLOCK_TARGET_NS(0), &rb_target_ns);
-
-		LOG_INF("DIAG pps readback: led_cfg=0x%08x gpio_cfg=0x%08x general_config=0x%08x "
-			"reload_sec=%u reload_ns=%u target_sec=%u target_ns=%u",
-			rb_led_cfg, rb_gpio_cfg, rb_general_config,
-			rb_reload_sec, rb_reload_ns, rb_target_sec, rb_target_ns);
-	}
 
 	return 0;
 }
@@ -1505,6 +1523,34 @@ static bool lan9250_1588_msg_type_is_timestamped(uint8_t msg_type)
  * in the 4-deep hardware buffer under very bursty PTP traffic). Called
  * with bank_lock held.
  */
+/* Counts how RX timestamp matching actually resolves in practice, to
+ * distinguish LAN9250_1588_RX_PENDING_MAX's 2-second-per-entry timeout
+ * being exercised as a rare fallback (as designed) from it becoming a
+ * routine, structural source of RX buffer pool pressure under real multi-
+ * board traffic. Printed periodically (every ~10s) rather than per-packet,
+ * to avoid recreating the log-volume-induced RX backpressure bug fixed
+ * earlier in this project's history.
+ */
+static uint32_t diag_matched_immediate;
+static uint32_t diag_matched_pending;
+static uint32_t diag_queued_pending;
+static uint32_t diag_expired_unmatched;
+static int64_t diag_last_summary_ms;
+
+static void diag_rx_match_summary(void)
+{
+	int64_t now = k_uptime_get();
+
+	if (now - diag_last_summary_ms < 10000) {
+		return;
+	}
+	diag_last_summary_ms = now;
+
+	LOG_INF("DIAG rx_match: immediate=%u pending_match=%u queued=%u expired=%u",
+		diag_matched_immediate, diag_matched_pending, diag_queued_pending,
+		diag_expired_unmatched);
+}
+
 static void lan9250_1588_rx_pending_expire(struct lan9250_runtime *context, int64_t now)
 {
 	for (size_t i = 0; i < LAN9250_1588_RX_PENDING_MAX; i++) {
@@ -1513,6 +1559,7 @@ static void lan9250_1588_rx_pending_expire(struct lan9250_runtime *context, int6
 		if (p->pkt != NULL && now >= p->deadline) {
 			LOG_DBG("1588 RX: pending entry expired unmatched (type=%u seq=%u)",
 				p->msg_type, p->seq_id);
+			diag_expired_unmatched++;
 			net_pkt_unref(p->pkt);
 			p->pkt = NULL;
 		}
@@ -1527,6 +1574,8 @@ static void lan9250_1588_rx_pending_expire(struct lan9250_runtime *context, int6
 			u->valid = false;
 		}
 	}
+
+	diag_rx_match_summary();
 }
 
 /*
@@ -1589,7 +1638,19 @@ static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net
 					    size_t pkt_len)
 {
 	struct lan9250_runtime *context = dev->data;
-	uint8_t header_buf[64];
+	/* Must cover the worst-case UDP/IPv4 PTP header offset
+	 * lan9250_ptp_parse_header() needs: 14 (Ethernet) + up to 60 (IPv4
+	 * with max IHL/options) + 8 (UDP) + 32 (PTP header through
+	 * sequenceId) = 114 bytes. 64 was sized for the raw L2 EtherType-
+	 * 0x88F7 case only (14 + 32 = 46) from this project's gPTP-era
+	 * bring-up, and silently truncated every UDP/IPv4-framed PTP message
+	 * (all of CONFIG_PTP's traffic) below the length
+	 * lan9250_ptp_parse_header() needs, so it always returned false and
+	 * this function returned before ever attempting a timestamp match -
+	 * the RX hardware timestamp was silently never attached to any
+	 * Sync/Delay_Req/Pdelay_Req/Pdelay_Resp message.
+	 */
+	uint8_t header_buf[128];
 	size_t header_len = MIN(pkt_len, sizeof(header_buf));
 	uint8_t pkt_msg_type;
 	uint16_t pkt_seq_id;
@@ -1635,6 +1696,7 @@ static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net
 				u->sec, u->ns, u->msg_type, u->seq_id);
 			u->valid = false;
 			attached = true;
+			diag_matched_immediate++;
 			break;
 		}
 	}
@@ -1685,6 +1747,7 @@ static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net
 		LOG_DBG("1588 RX timestamp: %u.%09u (type=%u seq=%u)", sec, ns, hw_msg_type,
 			hw_seq_id);
 		attached = true;
+		diag_matched_immediate++;
 	} else {
 		bool matched_pending = false;
 
@@ -1702,6 +1765,7 @@ static void lan9250_1588_rx_timestamp_check(const struct device *dev, struct net
 				net_pkt_unref(p->pkt);
 				p->pkt = NULL;
 				matched_pending = true;
+				diag_matched_pending++;
 				break;
 			}
 		}
@@ -1783,6 +1847,7 @@ queue:
 		slot->msg_type = pkt_msg_type;
 		slot->seq_id = pkt_seq_id;
 		slot->deadline = k_uptime_get() + LAN9250_1588_RX_PENDING_TIMEOUT_MS;
+		diag_queued_pending++;
 
 		/* DIAGNOSTIC (phase 5 gPTP bring-up): shows exactly what
 		 * every rx_pending entry is waiting for, to cross-reference

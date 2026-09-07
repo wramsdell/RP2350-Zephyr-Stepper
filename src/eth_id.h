@@ -26,4 +26,16 @@ void force_multicast_rejoin(struct net_if *iface, const char *addr_str);
  */
 void ptp_multicast_rejoin(struct net_if *iface);
 
+/* Starts a periodic (30s) IGMP membership-report refresh for iface, for
+ * the lifetime of the application. Necessary because this network's
+ * switch was confirmed to send zero IGMP query traffic - with no active
+ * querier, nothing else ever prompts a renewed report, and a switch's
+ * IGMP-snooping forwarding entry can silently age out with no signal to
+ * the host that it happened. See the definition's comment for the full
+ * story. Call once, after a working link is confirmed (same timing as
+ * the other multicast-join calls above); safe to call more than once,
+ * only the first call has any effect.
+ */
+void multicast_membership_refresh_start(struct net_if *iface);
+
 #endif /* ETH_ID_H */

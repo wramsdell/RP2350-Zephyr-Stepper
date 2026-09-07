@@ -4,7 +4,7 @@
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_pkt.h>
 #include <zephyr/net/ethernet.h>
-#include <zephyr/net/gptp.h>
+#include <zephyr/net/ptp.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/logging/log.h>
 
@@ -16,7 +16,7 @@ LOG_MODULE_REGISTER(ptp_shell, LOG_LEVEL_INF);
 int ptp_pps_arm_when_synced(const struct device *lan9250_dev, int max_wait_ms)
 {
 	struct net_if *iface;
-	bool is_master = false, as_capable = false;
+	bool is_time_transmitter = false, is_synced = false;
 	int64_t deadline;
 	int ret;
 
@@ -29,18 +29,19 @@ int ptp_pps_arm_when_synced(const struct device *lan9250_dev, int max_wait_ms)
 	deadline = k_uptime_get() + max_wait_ms;
 
 	while (k_uptime_get() < deadline) {
-		if (iface && gptp_get_port_sync_state(iface, &is_master, &as_capable) == 0 &&
-		    (is_master || as_capable)) {
+		if (iface &&
+		    ptp_get_port_sync_state(iface, &is_time_transmitter, &is_synced) == 0 &&
+		    (is_time_transmitter || is_synced)) {
 			break;
 		}
 		k_sleep(K_MSEC(500));
 	}
 
-	if (!is_master && !as_capable) {
-		LOG_WRN("Arming 1PPS output without confirmed gPTP sync "
-			"(is_master=%d as_capable=%d after %d ms) - alignment "
+	if (!is_time_transmitter && !is_synced) {
+		LOG_WRN("Arming 1PPS output without confirmed PTP sync "
+			"(is_time_transmitter=%d is_synced=%d after %d ms) - alignment "
 			"to any peer is not guaranteed",
-			is_master, as_capable, max_wait_ms);
+			is_time_transmitter, is_synced, max_wait_ms);
 	}
 
 	ret = lan9250_1588_pps_enable(lan9250_dev);
@@ -110,7 +111,7 @@ static int cmd_ptp_clock(const struct shell *sh, size_t argc, char **argv)
 static int cmd_ptp_pps(const struct shell *sh, size_t argc, char **argv)
 {
 	struct net_if *iface;
-	bool is_master = false, as_capable = false;
+	bool is_time_transmitter = false, is_synced = false;
 	int ret;
 
 	ARG_UNUSED(argc);
@@ -122,11 +123,12 @@ static int cmd_ptp_pps(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	iface = net_if_lookup_by_dev(lan9250_dev);
-	if (iface && gptp_get_port_sync_state(iface, &is_master, &as_capable) == 0 &&
-	    !is_master && !as_capable) {
-		shell_print(sh, "Waiting up to 30s for gPTP sync before arming "
-				"(is_master=%d as_capable=%d)...",
-			    is_master, as_capable);
+	if (iface &&
+	    ptp_get_port_sync_state(iface, &is_time_transmitter, &is_synced) == 0 &&
+	    !is_time_transmitter && !is_synced) {
+		shell_print(sh, "Waiting up to 30s for PTP sync before arming "
+				"(is_time_transmitter=%d is_synced=%d)...",
+			    is_time_transmitter, is_synced);
 	}
 
 	ret = ptp_pps_arm_when_synced(lan9250_dev, 30000);

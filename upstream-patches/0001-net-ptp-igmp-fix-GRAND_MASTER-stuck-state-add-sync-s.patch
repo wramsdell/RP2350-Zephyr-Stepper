@@ -1,0 +1,237 @@
+From 932dcc4283afb0297e3d9db9420a97db0c33e4cf Mon Sep 17 00:00:00 2001
+From: Ward Ramsdell <ward@rds-or.com>
+Date: Mon, 7 Sep 2026 01:05:42 -0700
+Subject: [PATCH] net: ptp/igmp: fix GRAND_MASTER stuck state, add
+ sync-status/IGMP-resend APIs
+
+Three related fixes made while bringing up CONFIG_PTP multi-board sync
+for the RP2350-Zephyr-Stepper project:
+
+- subsys/net/lib/ptp/state_machine.c: ptp_state_machine() had no
+  `case PTP_PS_GRAND_MASTER` in its switch at all, so a self-elected
+  grandmaster could never transition to any other state no matter what
+  BMCA decided afterward - every event fell through to `default: break`.
+  This is the mirror-image gap of zephyrproject/zephyr#99566 (already
+  fixed upstream, which covered TIME_TRANSMITTER never transitioning
+  *into* GRAND_MASTER - the reverse direction). Added the missing case,
+  mirroring TIME_TRANSMITTER's transition table.
+
+- subsys/net/ip/igmp.c + include/zephyr/net/igmp.h: added
+  net_ipv4_igmp_resend_reports(), which resends a membership report for
+  every already-joined group without touching join state.
+  net_ipv4_igmp_join() can't be reused for this - it's a deliberate
+  no-op once a group is already joined. On networks with no active IGMP
+  querier (confirmed via a live capture: zero query traffic at all),
+  nothing else ever prompts a renewed report, and an IGMP-snooping
+  switch's forwarding entry can silently age out with no signal to the
+  host that it happened.
+
+- subsys/net/lib/ptp/clock.c + include/zephyr/net/ptp.h: added
+  ptp_get_port_sync_state(), a public accessor for whether a port's
+  disciplined clock is currently trustworthy - the public API had no
+  port/clock status query at all otherwise. Mirrors the same purpose as
+  gPTP's gptp_get_port_sync_state().
+
+Local-only commit, not pushed upstream.
+---
+ include/zephyr/net/igmp.h          | 27 ++++++++++++++++++++++++++
+ include/zephyr/net/ptp.h           | 23 ++++++++++++++++++++++
+ subsys/net/ip/igmp.c               | 23 ++++++++++++++++++++++
+ subsys/net/lib/ptp/clock.c         | 31 ++++++++++++++++++++++++++++++
+ subsys/net/lib/ptp/state_machine.c | 25 ++++++++++++++++++++++++
+ 5 files changed, 129 insertions(+)
+
+diff --git a/include/zephyr/net/igmp.h b/include/zephyr/net/igmp.h
+index 02ad05cb701..4af3cebb780 100644
+--- a/include/zephyr/net/igmp.h
++++ b/include/zephyr/net/igmp.h
+@@ -67,6 +67,33 @@ static inline int net_ipv4_igmp_join(struct net_if *iface, const struct net_in_a
+ }
+ #endif
+ 
++/**
++ * @brief Resend an IGMP membership report for every currently-joined
++ * IPv4 multicast group on this interface, without touching join state.
++ *
++ * Unlike net_ipv4_igmp_join(), which is a no-op once a group is already
++ * joined, this always sends a fresh report - intended for application
++ * code to call periodically on networks with no active IGMP querier,
++ * where a switch's IGMP-snooping forwarding entry can otherwise silently
++ * age out with nothing to refresh it.
++ *
++ * @param iface Network interface to send the report(s) on.
++ *
++ * @retval 0 On success.
++ * @retval -ESRCH If no non-default groups are currently joined.
++ * @retval Other Any other error from packet allocation/transmission.
++ */
++#if defined(CONFIG_NET_IPV4_IGMP)
++int net_ipv4_igmp_resend_reports(struct net_if *iface);
++#else
++static inline int net_ipv4_igmp_resend_reports(struct net_if *iface)
++{
++	ARG_UNUSED(iface);
++
++	return -ENOSYS;
++}
++#endif
++
+ /**
+  * @brief Leave a given multicast group.
+  *
+diff --git a/include/zephyr/net/ptp.h b/include/zephyr/net/ptp.h
+index f61f32d9a75..d26a09b61de 100644
+--- a/include/zephyr/net/ptp.h
++++ b/include/zephyr/net/ptp.h
+@@ -23,6 +23,9 @@
+  * @{
+  */
+ 
++#include <stdbool.h>
++
++#include <zephyr/net/net_if.h>
+ #include <zephyr/net/ptp_time.h>
+ 
+ #ifdef __cplusplus
+@@ -34,6 +37,26 @@ extern "C" {
+ 
+ #define PTP_VERSION (PTP_MINOR_VERSION << 4 | PTP_MAJOR_VERSION) /**< PTP version IEEE-1588:2019 */
+ 
++/**
++ * @brief Get whether a PTP port's disciplined clock is currently
++ *        trustworthy enough to treat as synchronized.
++ *
++ * @details A port that is itself the time-transmitting reference (its own
++ *          clock IS the reference) or a receiver that has completed
++ *          initial calibration is the best available proxy for "safe to
++ *          treat this clock as synchronized" without exposing raw offset
++ *          tracking through the public API.
++ *
++ * @param iface Network interface corresponding to the PTP port to query.
++ * @param is_time_transmitter Set to true if this port is currently acting
++ *        as the time-transmitting reference (master/grandmaster).
++ * @param is_synced Set to true if this port is a receiver that has
++ *        completed initial calibration (state TIME_RECEIVER).
++ *
++ * @return 0 if the port was found, -ENODEV if iface has no PTP port.
++ */
++int ptp_get_port_sync_state(struct net_if *iface, bool *is_time_transmitter, bool *is_synced);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/subsys/net/ip/igmp.c b/subsys/net/ip/igmp.c
+index 2355b4f782d..3ba0a4eeedb 100644
+--- a/subsys/net/ip/igmp.c
++++ b/subsys/net/ip/igmp.c
+@@ -430,6 +430,29 @@ drop:
+ }
+ #endif
+ 
++/* DIAG EXPERIMENT: added to let application code periodically refresh IGMP
++ * membership without relying on the switch to send General/Group-Specific
++ * Queries - confirmed via a live capture that this network's switch sends
++ * zero IGMP query traffic at all (no active querier, common on a plain
++ * switch with no multicast router present), so send_igmp_report()/
++ * send_igmp_v3_report() are otherwise only ever reached in response to a
++ * query that never arrives. net_ipv4_igmp_join() alone can't be used for
++ * this - it's a deliberate no-op once net_if_ipv4_maddr_is_joined() is
++ * already true, so it never re-sends a report for a group already joined.
++ * Both send_igmp_report()'s and send_igmp_v3_report()'s query-header
++ * parameter is entirely unused in their bodies (confirmed by inspection) -
++ * both just iterate every already-joined address and resend a report for
++ * each - so passing NULL here is safe.
++ */
++int net_ipv4_igmp_resend_reports(struct net_if *iface)
++{
++#if defined(CONFIG_NET_IPV4_IGMPV3)
++	return send_igmp_v3_report(iface, NULL);
++#else
++	return send_igmp_report(iface, NULL);
++#endif
++}
++
+ enum net_verdict net_ipv4_igmp_input(struct net_pkt *pkt, struct net_ipv4_hdr *ip_hdr)
+ {
+ 	int ret;
+diff --git a/subsys/net/lib/ptp/clock.c b/subsys/net/lib/ptp/clock.c
+index e4a207572a7..9e3cdca4e3c 100644
+--- a/subsys/net/lib/ptp/clock.c
++++ b/subsys/net/lib/ptp/clock.c
+@@ -651,6 +651,37 @@ struct ptp_port *ptp_clock_port_from_iface(struct net_if *iface)
+ 	return NULL;
+ }
+ 
++/* ADDITION (temporary, local): public accessor for whether a port's
++ * disciplined clock is currently trustworthy enough to treat as
++ * synchronized - the public net/ptp.h header has no port/clock status
++ * query API at all otherwise. A port that is itself the time-transmitting
++ * reference (TIME_TRANSMITTER/PRE_TIME_TRANSMITTER/GRAND_MASTER - its own
++ * clock IS the reference) or a receiver that has completed initial
++ * calibration (TIME_RECEIVER, not UNCALIBRATED) is the best available
++ * proxy for "safe to seed a one-shot hardware output (like a 1PPS Clock
++ * Target) from this clock" without adding real offset tracking to the
++ * public API - mirrors the same reasoning applied to gPTP's
++ * gptp_get_port_sync_state() for the same purpose.
++ */
++int ptp_get_port_sync_state(struct net_if *iface, bool *is_time_transmitter, bool *is_synced)
++{
++	struct ptp_port *port = ptp_clock_port_from_iface(iface);
++	enum ptp_port_state state;
++
++	if (!port) {
++		return -ENODEV;
++	}
++
++	state = ptp_port_state(port);
++
++	*is_time_transmitter = (state == PTP_PS_TIME_TRANSMITTER ||
++				 state == PTP_PS_PRE_TIME_TRANSMITTER ||
++				 state == PTP_PS_GRAND_MASTER);
++	*is_synced = (state == PTP_PS_TIME_RECEIVER);
++
++	return 0;
++}
++
+ void ptp_clock_pollfd_invalidate(void)
+ {
+ 	ptp_clk.pollfd_valid = false;
+diff --git a/subsys/net/lib/ptp/state_machine.c b/subsys/net/lib/ptp/state_machine.c
+index 9c03608af13..afcd75cc64b 100644
+--- a/subsys/net/lib/ptp/state_machine.c
++++ b/subsys/net/lib/ptp/state_machine.c
+@@ -139,6 +139,31 @@ enum ptp_port_state ptp_state_machine(enum ptp_port_state state,
+ 			break;
+ 		}
+ 		break;
++	case PTP_PS_GRAND_MASTER:
++		switch (event) {
++		case PTP_EVT_DESIGNATED_DISABLED:
++			new_state = IS_ENABLED(CONFIG_PTP_DISABLED_PRESENT) ?
++					PTP_PS_DISABLED : new_state;
++			break;
++		case PTP_EVT_FAULT_DETECTED:
++			new_state = IS_ENABLED(CONFIG_PTP_FAULTY_PRESENT) ?
++					PTP_PS_FAULTY : new_state;
++			break;
++		case PTP_EVT_RS_TIME_TRANSMITTER:
++			new_state = IS_ENABLED(CONFIG_PTP_PRE_TIME_TRANSMITTER_PRESENT) ?
++					PTP_PS_PRE_TIME_TRANSMITTER : PTP_PS_TIME_TRANSMITTER;
++			break;
++		case PTP_EVT_RS_PASSIVE:
++			new_state = PTP_PS_PASSIVE;
++			break;
++		case PTP_EVT_RS_TIME_RECEIVER:
++			new_state = IS_ENABLED(CONFIG_PTP_UNCALIBRATED_PRESENT) ?
++					PTP_PS_UNCALIBRATED : PTP_PS_TIME_RECEIVER;
++			break;
++		default:
++			break;
++		}
++		break;
+ 	case PTP_PS_PASSIVE:
+ 		switch (event) {
+ 		case PTP_EVT_DESIGNATED_DISABLED:
+-- 
+2.43.0
+

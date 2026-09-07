@@ -42,6 +42,30 @@ static void handler(struct net_mgmt_event_callback *cb,
 {
 	int i = 0;
 
+	if (mgmt_event == NET_EVENT_IF_UP) {
+		/* Restart DHCP fresh on every link-up transition, not just at
+		 * boot. Confirmed via a real link-flap event (a cold-spray
+		 * disturbance test briefly perturbing the LAN9250's PHY): the
+		 * board came back with its interface operationally up but no
+		 * valid IPv4 address at all (net_ctx: "src addr is
+		 * unspecified", every PTP send failing with
+		 * "ptp_transport: Failed to send message") and never
+		 * recovered on its own - the DHCP client's own state machine
+		 * doesn't appear to notice a link bounce and re-acquire on
+		 * its own. net_dhcpv4_stop() before net_dhcpv4_start() forces
+		 * a genuinely fresh acquisition rather than trusting whatever
+		 * internal state (e.g. still considering itself BOUND) the
+		 * client was left in - calling stop() on a client that was
+		 * never started, or already stopped, is a safe no-op, so
+		 * this is fine to also run unconditionally on the very first
+		 * boot-time link-up alongside main()'s own initial
+		 * start_dhcpv4_client() call.
+		 */
+		net_dhcpv4_stop(iface);
+		net_dhcpv4_start(iface);
+		return;
+	}
+
 	if (mgmt_event != NET_EVENT_IPV4_ADDR_ADD) {
 		return;
 	}
@@ -52,13 +76,26 @@ static void handler(struct net_mgmt_event_callback *cb,
 	 * before the PHY has linked. See mdns_force_multicast_rejoin(). */
 	mdns_force_multicast_rejoin(iface);
 
-	/* PTP (224.0.1.129 general/event, 224.0.0.107 peer-delay) has no
-	 * boot-time join of its own to race - nothing subscribes to it
-	 * until now - so this is the group's only join, not a "force
-	 * rejoin", but it still needs the same timing (a confirmed-up link)
-	 * and the same refcount-safe join path. See ptp_multicast_rejoin()
-	 * (eth_id.c). */
-	ptp_multicast_rejoin(iface);
+	/* ptp_multicast_rejoin() is deliberately NOT called here anymore. It
+	 * was based on the false assumption that CONFIG_PTP has no boot-time
+	 * multicast join of its own - it does (transport_join_multicast(),
+	 * confirmed to run right after link-up and succeed). Draining and
+	 * rejoining the group out from under the PTP library's own
+	 * already-good membership was corrupting it, which is why role
+	 * negotiation (BMCA) never converged between boards: both stayed
+	 * self-elected masters, each barely receiving the other's
+	 * Announce/Sync traffic despite it being confirmed present on the
+	 * wire. */
+
+	/* This network's switch sends zero IGMP query traffic (confirmed via
+	 * a live capture) - no active querier, so nothing else ever prompts
+	 * a renewed membership report. Without periodic refreshing, the
+	 * switch's IGMP-snooping forwarding entries can silently age out,
+	 * which is why multi-board PTP reception was observed to work for a
+	 * while then intermittently drop, worsening as more boards competed
+	 * for the switch's table. See multicast_membership_refresh_start()'s
+	 * comment (eth_id.c/h) for the full story. */
+	multicast_membership_refresh_start(iface);
 
 	for (i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
 		char buf[NET_IPV4_ADDR_LEN];
@@ -125,7 +162,7 @@ int main(void)
 	}
 
 	net_mgmt_init_event_callback(&mgmt_cb, handler,
-				     NET_EVENT_IPV4_ADDR_ADD);
+				     NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IF_UP);
 	net_mgmt_add_event_callback(&mgmt_cb);
 
 	net_dhcpv4_init_option_callback(&dhcp_cb, option_handler,
@@ -147,14 +184,14 @@ int main(void)
 	 *    hasn't fully settled that early, even though device_is_ready()
 	 *    and the SPI writes themselves both report success.
 	 *
-	 * 2. ptp_pps_arm_when_synced() then additionally waits for gPTP to
+	 * 2. ptp_pps_arm_when_synced() then additionally waits for PTP to
 	 *    consider this port's clock trustworthy before actually arming -
 	 *    otherwise the Clock Target gets seeded from whatever the local
 	 *    clock happens to read mid-negotiation, silently baking in
 	 *    however far off that was as a fixed offset between this board's
-	 *    pulses and its peer's (see gptp_get_port_sync_state()'s doc
-	 *    comment). Falls back to arming anyway past its own timeout, for
-	 *    a standalone board with no peer to sync to.
+	 *    pulses and its peer's (see ptp_get_port_sync_state()'s doc
+	 *    comment, zephyr/net/ptp.h). Falls back to arming anyway past its
+	 *    own timeout, for a standalone board with no peer to sync to.
 	 */
 	k_sleep(K_SECONDS(15));
 	{
