@@ -8,6 +8,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/net/net_stats.h>
 
 #ifndef _LAN9250_
 #define _LAN9250_
@@ -53,6 +54,12 @@
 #define LAN9250_RX_FIFO_INF    0x007C
 #define LAN9250_TX_FIFO_INF    0x0080
 #define LAN9250_PMT_CTRL       0x0084
+/* Host MAC RX Dropped Frames Counter (datasheet DS00001913C, Section
+ * 11.14.7, page 182): increments whenever the RX Data FIFO fills up and
+ * a frame is lost inside the chip's own MIL FIFO, before the driver's
+ * RX_FIFO_INF/RX_STATUS_FIFO read path ever sees it. Clears on read.
+ */
+#define LAN9250_RX_DROP        0x00A0
 #define LAN9250_MAC_CSR_CMD    0x00A4
 #define LAN9250_MAC_CSR_DATA   0x00A8
 #define LAN9250_AFC_CFG        0x00AC
@@ -537,6 +544,18 @@ struct lan9250_runtime {
 	struct k_sem tx_rx_sem;
 	struct k_sem int_sem;
 	uint8_t buf[NET_ETH_MAX_FRAME_SIZE];
+
+#if defined(CONFIG_NET_STATISTICS_ETHERNET)
+	/* Backing storage for CONFIG_NET_STATISTICS_ETHERNET - without a
+	 * .get_stats callback returning this, eth_stats_get_common() (see
+	 * subsys/net/l2/ethernet/eth_stats.h) always returns NULL and every
+	 * eth_stats_update_*() call across the whole stack (errors.rx,
+	 * multicast.rx, unknown-protocol, ...) silently no-ops instead of
+	 * counting anything. TEMPORARY: added to find out where inbound PTP
+	 * multicast traffic is actually being lost.
+	 */
+	struct net_stats_eth stats;
+#endif
 
 	/* Set once, by the separate ptp_clock device's own init function
 	 * (drivers/eth_lan9250/ptp_clock_lan9250.c) - not devicetree-backed,

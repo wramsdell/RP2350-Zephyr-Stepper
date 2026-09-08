@@ -44,4 +44,10 @@ int lan9250_ptp_clock_rate_adjust(const struct device *dev, double ratio);
  */
 int lan9250_1588_pps_enable(const struct device *dev);
 
+/* Reads and clears the hardware RX_DROP counter (see the comment on
+ * LAN9250_RX_DROP) - the number of frames the chip's own MIL FIFO lost
+ * before the driver's RX_FIFO_INF/RX_STATUS_FIFO path ever saw them.
+ */
+int lan9250_rx_drop_get(const struct device *dev, uint32_t *rx_drop);
+
 #endif /* ETH_LAN9250_PTP_H */

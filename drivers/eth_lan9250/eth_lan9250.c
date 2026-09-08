@@ -724,13 +724,35 @@ static int lan9250_rx(const struct device *dev)
 		return 0;
 	}
 
-	/* Read dummy  data */
+	/* Read dummy data - this drains the RX_CFG RXDOFF=4 start-of-packet
+	 * offset configured in lan9250_init(), NOT an FCS/CRC field.
+	 * LAN9250_RX_STS_PACKET_LEN already reports the exact Ethernet
+	 * frame length (no FCS, no RXDOFF) - confirmed empirically against
+	 * real captured frame lengths (e.g. a Follow_Up message's raw
+	 * status length reads exactly 86, matching its wire frame.len
+	 * exactly). This used to be followed by a "pkt_len -= 4" that
+	 * wrongly assumed the reported length included a 4-byte FCS,
+	 * silently truncating the last 4 bytes of every received frame and
+	 * leaving them stuck in the FIFO to desync every subsequent
+	 * frame's read (manifesting as garbage/misaligned EtherTypes like
+	 * 0xc0a8 - the raw bytes of "192.168" from a shifted IPv4 header).
+	 */
 	ret = lan9250_read_sys_reg(dev, LAN9250_RX_DATA_FIFO, &tmp);
 	if (ret < 0) {
 		return ret;
 	}
-	pkt_len -= 4;
 	frame_len = pkt_len;
+
+	/* RX_CFG's RX_EA field (bits 31:30) is left at its default 00b (4-
+	 * byte end alignment): the chip pads the last transfer of
+	 * (RXDOFF + frame) up to a DWORD boundary. RXDOFF is already a
+	 * whole DWORD, so the needed pad is purely a function of the
+	 * frame's own length remainder - drained below, after the frame's
+	 * real bytes, instead of the old fixed 4-byte read that only
+	 * happened to be correct when frame_len was itself a multiple of
+	 * 4.
+	 */
+	uint16_t end_pad = (4 - (frame_len % 4)) % 4;
 
 	if (pkt_len > NET_ETH_MAX_FRAME_SIZE) {
 		LOG_ERR("Maximum frame length exceeded, it should be: %d", NET_ETH_MAX_FRAME_SIZE);
@@ -793,7 +815,9 @@ static int lan9250_rx(const struct device *dev)
 			}
 			pkt_len -= chunk;
 		}
-		(void)lan9250_read_sys_reg(dev, LAN9250_RX_DATA_FIFO, &tmp);
+		if (end_pad > 0) {
+			(void)lan9250_read_buf(dev, NULL, end_pad);
+		}
 		return 0;
 	}
 
@@ -818,9 +842,11 @@ static int lan9250_rx(const struct device *dev)
 		pkt_buf = pkt_buf->frags;
 	} while (pkt_len > 0);
 
-	ret = lan9250_read_sys_reg(dev, LAN9250_RX_DATA_FIFO, &tmp);
-	if (ret < 0) {
-		return ret;
+	if (end_pad > 0) {
+		ret = lan9250_read_buf(dev, NULL, end_pad);
+		if (ret < 0) {
+			return ret;
+		}
 	}
 
 	lan9250_1588_rx_timestamp_check(dev, pkt, frame_len);
@@ -1184,6 +1210,11 @@ static int lan9250_set_config(const struct device *dev, enum ethernet_config_typ
 	return -ENOTSUP;
 }
 
+int lan9250_rx_drop_get(const struct device *dev, uint32_t *rx_drop)
+{
+	return lan9250_read_sys_reg(dev, LAN9250_RX_DROP, rx_drop);
+}
+
 /*
  * Returns the separate ptp_clock device wrapping this driver's 1588
  * clock, once drivers/eth_lan9250/ptp_clock_lan9250.c's own init has run
@@ -1198,12 +1229,24 @@ static const struct device *lan9250_get_ptp_clock(const struct device *dev)
 	return context->ptp_clock;
 }
 
+#if defined(CONFIG_NET_STATISTICS_ETHERNET)
+static struct net_stats_eth *lan9250_get_stats(const struct device *dev)
+{
+	struct lan9250_runtime *ctx = dev->data;
+
+	return &ctx->stats;
+}
+#endif
+
 static const struct ethernet_api api_funcs = {
 	.iface_api.init = lan9250_iface_init,
 	.get_capabilities = lan9250_get_capabilities,
 	.set_config = lan9250_set_config,
 	.send = lan9250_tx,
 	.get_ptp_clock = lan9250_get_ptp_clock,
+#if defined(CONFIG_NET_STATISTICS_ETHERNET)
+	.get_stats = lan9250_get_stats,
+#endif
 };
 
 /*

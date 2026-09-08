@@ -246,6 +246,27 @@ static int cmd_ptp_txtest(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_ptp_rxdrop(const struct shell *sh, size_t argc, char **argv)
+{
+	uint32_t rx_drop;
+	int ret;
+
+	if (!device_is_ready(lan9250_dev)) {
+		shell_error(sh, "lan9250 device not ready");
+		return -ENODEV;
+	}
+
+	ret = lan9250_rx_drop_get(lan9250_dev, &rx_drop);
+	if (ret < 0) {
+		shell_error(sh, "read failed: %d", ret);
+		return ret;
+	}
+
+	shell_print(sh, "RX_DROP (hardware MIL FIFO drops, clears on read) = %u", rx_drop);
+
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_ptp,
 	SHELL_CMD(clock, NULL,
 		  "Read the LAN9250's 1588 PTP hardware clock twice, ~200ms apart",
@@ -256,6 +277,9 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_ptp,
 	SHELL_CMD(txtest, NULL,
 		  "Send a real L2 PTP Sync frame to test hardware TX timestamping",
 		  cmd_ptp_txtest),
+	SHELL_CMD(rxdrop, NULL,
+		  "Read (and clear) the LAN9250's hardware RX_DROP (MIL FIFO drop) counter",
+		  cmd_ptp_rxdrop),
 	SHELL_SUBCMD_SET_END
 );
 
