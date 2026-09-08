@@ -214,10 +214,14 @@
 #define LAN9250_1588_CLOCK_EVENT_MODE_TOGGLE      0x1
 #define LAN9250_1588_CLOCK_EVENT_MODE_INT_BIT     0x2
 
-/* LAN9250 Host MAC registers */
+/* LAN9250 Host MAC registers (datasheet DS00001913C, Table 11-17, page
+ * 191 - indirect addresses, reached via MAC_CSR_CMD/MAC_CSR_DATA).
+ */
 #define LAN9250_HMAC_CR       0x01
 #define LAN9250_HMAC_ADDRH    0x02
 #define LAN9250_HMAC_ADDRL    0x03
+#define LAN9250_HMAC_HASHH    0x04
+#define LAN9250_HMAC_HASHL    0x05
 #define LAN9250_HMAC_MII_ACC  0x06
 #define LAN9250_HMAC_MII_DATA 0x07
 
@@ -570,6 +574,17 @@ struct lan9250_runtime {
 	 * SPI RX FIFO - see lan9250_1588_rx_unclaimed. Guarded by bank_lock.
 	 */
 	struct lan9250_1588_rx_unclaimed rx_unclaimed[LAN9250_1588_RX_PENDING_MAX];
+
+	/* Per-bit reference count for the 64-bit multicast hash filter
+	 * (HMAC_HASHH/HMAC_HASHL - see lan9250_mcast_hash_bit() and
+	 * lan9250_set_config()'s ETHERNET_CONFIG_TYPE_FILTER case). More
+	 * than one joined multicast group can hash to the same bit (a
+	 * 6-bit index has only 64 possible values), so a bit can only be
+	 * cleared in hardware once every group that mapped to it has been
+	 * left, not on the first leave. Guarded by hash_lock.
+	 */
+	uint8_t mcast_hash_refcount[64];
+	struct k_mutex hash_lock;
 };
 
 #endif /*_LAN9250_*/

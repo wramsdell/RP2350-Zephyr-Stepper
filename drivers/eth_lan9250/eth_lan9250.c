@@ -584,20 +584,50 @@ static int lan9250_configure(const struct device *dev)
 	 *   - Full duplex
 	 *   - TX enable
 	 *   - RX enable
-	 *   - Pass all multicast frames
-	 *   - Hash filtering disabled
+	 *   - Hash Perfect filtering mode: unicast perfect-filtered against
+	 *     our own MAC (HMAC_ADDRH/L, HO left clear), multicast
+	 *     hash-filtered against HMAC_HASHH/L (HPFILT set, MCPAS clear)
 	 *   - Promiscuous disabled
 	 *
-	 * Upstream Zephyr's driver has this exact comment but never actually
-	 * sets MCPAS, so "pass all multicast frames" was never true - the
-	 * hardware RX filter silently dropped every multicast frame (mDNS,
-	 * IGMP) regardless of anything at the IP/IGMP layer. Fixed here; see
-	 * the file header comment and THEORY_OF_OPERATION.md.
+	 * This project originally ran with MCPAS (Pass All Multicast) set
+	 * instead - upstream Zephyr's driver has a comment claiming this
+	 * mode but never actually set the bit, so every multicast frame
+	 * (mDNS, IGMP) was silently dropped by hardware regardless of the
+	 * IP/IGMP layer; this project's own fork fixed that by actually
+	 * setting MCPAS. MCPAS was a blunt instrument, though: per the
+	 * datasheet (DS00001913C, Section 11.15.4, "HMAC_HASHH"), MCPAS
+	 * overrides the hash table entirely and accepts every multicast
+	 * frame on the wire unconditionally, regardless of whether this
+	 * interface has actually joined that group. On a network with other
+	 * multicast traffic (any device's own mDNS, other multicast
+	 * chatter), that meant every one of those irrelevant frames still
+	 * had to be pulled across this driver's SPI link and processed by
+	 * the RP2350 - real, wasted SPI/RX-thread bandwidth on frames
+	 * nothing here ever wanted, on a link whose throughput is bounded by
+	 * SPI transaction rate, not wire speed. Hash Perfect mode (verified
+	 * against Table 11-1, page 141) rejects multicast frames at the
+	 * MAC's own address-check logic - before they ever reach the RX
+	 * FIFO the host has to drain - unless their destination hashes to a
+	 * bit this interface has actually asked for via a real IGMP/MLD
+	 * join. HMAC_HASHH/HMAC_HASHL start at 0 here (reject all
+	 * multicast) and get populated dynamically as groups are joined -
+	 * see lan9250_get_capabilities()'s ETHERNET_HW_FILTERING and
+	 * lan9250_set_config()'s ETHERNET_CONFIG_TYPE_FILTER case.
 	 */
 	ret = lan9250_write_mac_reg(dev, LAN9250_HMAC_CR,
 				    LAN9250_HMAC_CR_PADSTR | LAN9250_HMAC_CR_TXEN |
 					    LAN9250_HMAC_CR_RXEN | LAN9250_HMAC_CR_FDPX |
-					    LAN9250_HMAC_CR_MCPAS);
+					    LAN9250_HMAC_CR_HPFILT);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_mac_reg(dev, LAN9250_HMAC_HASHL, 0);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ret = lan9250_write_mac_reg(dev, LAN9250_HMAC_HASHH, 0);
 	if (ret < 0) {
 		return ret;
 	}
@@ -937,7 +967,15 @@ static enum ethernet_hw_caps lan9250_get_capabilities(const struct device *dev)
 	 * to work at all, even though phase 3 already wired up
 	 * .get_ptp_clock itself.
 	 */
-	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE | ETHERNET_PTP
+	/* ETHERNET_HW_FILTERING: makes Zephyr's own ethernet_mcast_monitor_cb()
+	 * (subsys/net/l2/ethernet/ethernet.c) call this driver's set_config()
+	 * with ETHERNET_CONFIG_TYPE_FILTER on every multicast group join/
+	 * leave, which is how the LAN9250's 64-bit hardware hash filter gets
+	 * populated - see lan9250_set_config()'s ETHERNET_CONFIG_TYPE_FILTER
+	 * case and lan9250_init()'s Hash Perfect mode setup.
+	 */
+	return ETHERNET_LINK_10BASE | ETHERNET_LINK_100BASE | ETHERNET_PTP |
+	       ETHERNET_HW_FILTERING
 #if defined(CONFIG_NET_PROMISCUOUS_MODE)
 		| ETHERNET_PROMISC_MODE
 #endif
@@ -960,6 +998,73 @@ static void lan9250_iface_init(struct net_if *iface)
 			CONFIG_RP2350ZS_ETH_LAN9250_RX_THREAD_STACK_SIZE,
 			lan9250_thread, (void *)dev, NULL, NULL,
 			K_PRIO_COOP(CONFIG_RP2350ZS_ETH_LAN9250_RX_THREAD_PRIO), 0, K_NO_WAIT);
+}
+
+/*
+ * Standard Ethernet multicast-hash CRC (the same algorithm used by
+ * essentially every 10/100 MAC with a 64-bit hash filter, and by the
+ * Linux kernel's own ether_crc() helper for identical purposes) - CRC-32
+ * over the 6 destination-address bytes, reflected polynomial 0xEDB88320,
+ * initial value all-ones. Confirmed against the LAN9250 datasheet
+ * (DS00001913C, Section 11.4.2, "Hash Only Filtering", page 142): "the
+ * destination address in the incoming frame is passed through the CRC
+ * logic and the upper 6-bits of the CRC register are used to index the
+ * contents of the hash table. The most significant bit determines the
+ * register to be used (HMAC_HASHH or HMAC_HASHL), while the other five
+ * bits determine the bit within the register."
+ */
+static uint32_t lan9250_ether_crc(const uint8_t addr[6])
+{
+	uint32_t crc = 0xffffffffUL;
+
+	for (int byte = 0; byte < 6; byte++) {
+		uint8_t data = addr[byte];
+
+		for (int bit = 0; bit < 8; bit++) {
+			crc = (crc >> 1) ^ (((crc ^ data) & 1) ? 0xEDB88320UL : 0);
+			data >>= 1;
+		}
+	}
+
+	return crc;
+}
+
+/* Returns the 0-63 hash table bit index for a multicast MAC address, per
+ * the algorithm in lan9250_ether_crc()'s comment: the upper 6 bits of the
+ * CRC register (bits 31:26).
+ */
+static uint8_t lan9250_mcast_hash_bit(const uint8_t addr[6])
+{
+	return (uint8_t)(lan9250_ether_crc(addr) >> 26);
+}
+
+/* Recomputes and writes HMAC_HASHH/HMAC_HASHL from the current
+ * mcast_hash_refcount[] state. Caller must hold ctx->hash_lock.
+ */
+static int lan9250_mcast_hash_write(const struct device *dev)
+{
+	struct lan9250_runtime *ctx = dev->data;
+	uint32_t hashh = 0, hashl = 0;
+	int ret;
+
+	for (int bit = 0; bit < 64; bit++) {
+		if (ctx->mcast_hash_refcount[bit] == 0) {
+			continue;
+		}
+
+		if (bit < 32) {
+			hashl |= BIT(bit);
+		} else {
+			hashh |= BIT(bit - 32);
+		}
+	}
+
+	ret = lan9250_write_mac_reg(dev, LAN9250_HMAC_HASHL, hashl);
+	if (ret < 0) {
+		return ret;
+	}
+
+	return lan9250_write_mac_reg(dev, LAN9250_HMAC_HASHH, hashh);
 }
 
 static int lan9250_set_config(const struct device *dev, enum ethernet_config_type type,
@@ -1008,7 +1113,13 @@ static int lan9250_set_config(const struct device *dev, enum ethernet_config_typ
 					return -EALREADY;
 				}
 
-				reg |= LAN9250_HMAC_CR_MCPAS;
+				/* Restore Hash Perfect mode (see
+				 * lan9250_init()'s comment) rather than the
+				 * old Pass-All-Multicast behavior - this
+				 * project no longer runs with MCPAS set.
+				 */
+				reg &= ~LAN9250_HMAC_CR_MCPAS;
+				reg |= LAN9250_HMAC_CR_HPFILT;
 				reg &= ~LAN9250_HMAC_CR_PRMS;
 				reg &= ~LAN9250_HMAC_CR_HO;
 			}
@@ -1017,6 +1128,55 @@ static int lan9250_set_config(const struct device *dev, enum ethernet_config_typ
 		}
 
 		break;
+	case ETHERNET_CONFIG_TYPE_FILTER:
+		/* Only multicast destination-address filtering is
+		 * implemented (source-address filtering isn't a LAN9250
+		 * hardware feature at all, per the datasheet's Address
+		 * Filtering chapter). Zephyr's own ethernet L2 layer
+		 * (ethernet_mcast_monitor_cb(), subsys/net/l2/ethernet/
+		 * ethernet.c) calls this for every IPv4/IPv6 multicast
+		 * group join/leave on this interface, since
+		 * ETHERNET_HW_FILTERING is advertised below - no separate
+		 * monitoring needed on this driver's part.
+		 */
+		if (config->filter.type != ETHERNET_FILTER_TYPE_DST_MAC_ADDRESS) {
+			return -ENOTSUP;
+		}
+
+		if (!(config->filter.mac_address.addr[0] & 0x01)) {
+			/* Not actually a multicast address - shouldn't
+			 * happen given the caller, but the hash filter only
+			 * ever applies to multicast per the datasheet, so
+			 * there's nothing meaningful to do with a unicast
+			 * address here.
+			 */
+			return -ENOTSUP;
+		}
+
+		{
+			struct lan9250_runtime *ctx = dev->data;
+			uint8_t bit = lan9250_mcast_hash_bit(config->filter.mac_address.addr);
+
+			k_mutex_lock(&ctx->hash_lock, K_FOREVER);
+
+			if (config->filter.set) {
+				ctx->mcast_hash_refcount[bit]++;
+			} else if (ctx->mcast_hash_refcount[bit] > 0) {
+				/* Only decrement, never write the register,
+				 * if another still-joined group also hashes
+				 * to this same bit (see mcast_hash_refcount's
+				 * comment in eth_lan9250_priv.h) - checked via
+				 * the refcount reaching zero below, not by
+				 * skipping the decrement itself.
+				 */
+				ctx->mcast_hash_refcount[bit]--;
+			}
+
+			ret = lan9250_mcast_hash_write(dev);
+			k_mutex_unlock(&ctx->hash_lock);
+		}
+
+		return ret;
 	default:
 		break;
 	}
@@ -2101,6 +2261,7 @@ static int lan9250_init(const struct device *dev)
 		.tx_rx_sem = Z_SEM_INITIALIZER(lan9250_##inst##_runtime.tx_rx_sem, 1, UINT_MAX),   \
 		.int_sem = Z_SEM_INITIALIZER(lan9250_##inst##_runtime.int_sem, 0, UINT_MAX),       \
 		.bank_lock = Z_MUTEX_INITIALIZER(lan9250_##inst##_runtime.bank_lock),              \
+		.hash_lock = Z_MUTEX_INITIALIZER(lan9250_##inst##_runtime.hash_lock),              \
 	};                                                                                         \
                                                                                                    \
 	static const struct lan9250_config lan9250_##inst##_config = {                             \
